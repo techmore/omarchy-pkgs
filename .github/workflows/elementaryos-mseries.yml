@@ -61,10 +61,12 @@ jobs:
             names=$(git diff --name-only "$BEFORE" HEAD -- $(printf 'pkgbuilds/%s ' $names) \
               | awk -F/ '{print $2}' | sort -u)
           fi
-          # aarch64 only, and GitHub's arm64 runner for every package: the
-          # Namespace runner package_runner names for kernels is omacom's.
+          # aarch64 only. Repo variable PKG_RUNNER (a JSON label list) picks the
+          # runner, e.g. the owner's M4 mini VM; otherwise GitHub's arm64 runner.
+          # The Namespace runner package_runner names for kernels is omacom's.
+          runner='${{ vars.PKG_RUNNER || '["ubuntu-24.04-arm"]' }}'
           matrix=$(printf '%s\n' $names | bin/build-matrix --arch aarch64 \
-            | jq -c '.include |= map(.runner = "[\"ubuntu-24.04-arm\"]")')
+            | jq -c --arg r "$runner" '.include |= map(.runner = $r)')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           jq -r '.include[] | "\(.package) \(.arch) on \(.runner)"' <<<"$matrix"
 
@@ -83,8 +85,9 @@ jobs:
       - name: Build ${{ matrix.package }} (${{ matrix.arch }})
         env:
           CONTAINER_ENGINE: docker
-          # The runner has 4 vCPUs; the PKGBUILDs default to -j10.
-          OMARCHY_BUILD_JOBS: 4
+          # GitHub's runner has 4 vCPUs (the PKGBUILDs default to -j10); PKG_BUILD_JOBS
+          # overrides it for a larger self-hosted runner.
+          OMARCHY_BUILD_JOBS: ${{ vars.PKG_BUILD_JOBS || 4 }}
         run: bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
       - name: Upload test logs
         if: failure()
