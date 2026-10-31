@@ -64,7 +64,7 @@ jobs:
           # aarch64 only. Repo variable PKG_RUNNER (a JSON label list) picks the
           # runner, e.g. the owner's M4 mini VM; otherwise GitHub's arm64 runner.
           # The Namespace runner package_runner names for kernels is omacom's.
-          runner='${{ vars.PKG_RUNNER || '["ubuntu-24.04-arm"]' }}'
+          runner='${{ vars.PKG_RUNNER || '["ubuntu-26.04-arm"]' }}'
           matrix=$(printf '%s\n' $names | bin/build-matrix --arch aarch64 \
             | jq -c --arg r "$runner" '.include |= map(.runner = $r)')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
