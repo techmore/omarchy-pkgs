@@ -19,13 +19,14 @@ url='https://github.com/joshuaswarren/omarchy-ane'
 license=('GPL-2.0-only OR MIT')
 # dtc 1.7.1 is the first fdtoverlay that keeps a labelled node's phandle,
 # which both overlays rely on (the base device trees carry no __symbols__).
-depends=('dkms' 'linux-aurora-headers' 'dtc>=1:1.7.1')
+# linux-aurora is built with clang, and dkms then builds modules with LLVM=1.
+depends=('dkms' 'linux-aurora-headers' 'clang' 'llvm' 'lld' 'dtc>=1:1.7.1')
 optdepends=('omarchy-mac-boot: applies the overlays once their opt-in key is listed'
             'python: ane-h16-experimental firmware (stage=boot only)')
 # omarchy-mac-boot reads package-owned overlays from 20261004-2 on.
 conflicts=('omarchy-mac-boot<20261004-2')
 makedepends=('dtc')
-checkdepends=('dkms' 'fakeroot' 'linux-aurora-headers' 'dtc' 'kmod')
+checkdepends=('dkms' 'fakeroot' 'linux-aurora-headers' 'clang' 'llvm' 'lld' 'dtc' 'kmod')
 install=$pkgname.install
 
 # The kernel commit linux-aurora pins (techmore/linux-m1pro-touchid
@@ -138,7 +139,10 @@ check() {
   mkdir -p "$srcdir/check/dkms" "$srcdir/check/src"
   local dkms_options=(--dkmstree "$srcdir/check/dkms" --sourcetree "$srcdir/check/src" -k "$kver")
   fakeroot dkms "${dkms_options[@]}" add "$srcdir/dkms/$pkgname-$pkgver"
-  fakeroot dkms "${dkms_options[@]}" build "$pkgname/$pkgver"
+  fakeroot dkms "${dkms_options[@]}" build "$pkgname/$pkgver" || {
+    cat "$srcdir/check/dkms/$pkgname/$pkgver/build/make.log" >&2 || :
+    return 1
+  }
   local ko
   ko=$(ls "$srcdir/check/dkms/$pkgname/$pkgver/$kver"/*/module/ane_h16.ko*)
   [[ -z $(modinfo -F alias "$ko") ]] || { echo "check: ane_h16 has a module alias; it must never autoload" >&2; return 1; }
