@@ -27,6 +27,10 @@ on:
         description: "Space-separated package directories to build"
         default: "omarchy-mlx-m4 tensorfold-vulkan"
         required: true
+      runner:
+        description: "runs-on label list as JSON; empty takes PKG_RUNNER, else GitHub's arm64 runner"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -50,6 +54,8 @@ jobs:
       - id: list
         env:
           BEFORE: ${{ github.event.before }}
+          RUNNER_INPUT: ${{ github.event.inputs.runner }}
+          PKG_RUNNER: ${{ vars.PKG_RUNNER }}
         run: |
           set -euo pipefail
           names="${{ github.event.inputs.packages || 'omarchy-mlx-m4 tensorfold-vulkan' }}"
@@ -62,10 +68,10 @@ jobs:
             names=$(git diff --name-only "$BEFORE" HEAD -- $(printf 'pkgbuilds/%s ' $names) \
               | awk -F/ '{print $2}' | sort -u)
           fi
-          # aarch64 only. Repo variable PKG_RUNNER (a JSON label list) picks the
-          # runner, e.g. the owner's M4 mini VM; otherwise GitHub's arm64 runner.
-          # The Namespace runner package_runner names for kernels is omacom's.
-          runner='${{ vars.PKG_RUNNER || '["ubuntu-24.04-arm"]' }}'
+          # aarch64 only. A dispatch's runner input, else repo variable PKG_RUNNER
+          # (a JSON label list, e.g. the owner's M4 mini VM), else GitHub's arm64
+          # runner. The Namespace runner package_runner names for kernels is omacom's.
+          runner=${RUNNER_INPUT:-${PKG_RUNNER:-'["ubuntu-24.04-arm"]'}}
           matrix=$(printf '%s\n' $names | bin/build-matrix --arch aarch64 \
             | jq -c --arg r "$runner" '.include |= map(.runner = $r)')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
