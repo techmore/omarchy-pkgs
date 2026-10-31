@@ -1,0 +1,16 @@
+#!/bin/bash
+# TensorFold's native Vulkan server on Aurora Honeykrisp (vulkan-aurora).
+# The driver choice is made for this process only: VK_DRIVER_FILES names the
+# vulkan-aurora manifest and nothing else, so no other installed ICD (llvmpipe,
+# a private omarchy-mlx driver) is enumerated. Nothing system-wide changes.
+# TENSORFOLD_VK_ICD names another manifest for a test.
+set -euo pipefail
+
+icd=${TENSORFOLD_VK_ICD:-/usr/share/vulkan/icd.d/asahi_icd.aarch64.json}
+if [[ ! -r $icd ]]; then
+  echo "tensorfold-vulkan: Vulkan driver manifest not found: $icd (install vulkan-aurora)" >&2
+  exit 1
+fi
+unset VK_ICD_FILENAMES VK_ADD_DRIVER_FILES
+export VK_DRIVER_FILES=$icd
+exec /usr/lib/tensorfold-vulkan/tensorfold-native-vulkan "$@"

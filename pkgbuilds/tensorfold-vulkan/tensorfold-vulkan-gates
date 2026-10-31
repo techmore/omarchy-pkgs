@@ -1,0 +1,80 @@
+#!/bin/bash
+# TensorFold's Vulkan operator gates (stages 1-5) and kernel contract (six
+# groups) on this machine's GPU, through the same process-local driver choice
+# as tensorfold-vulkan. Run them once on new hardware before any model run.
+#
+#   tensorfold-vulkan-gates          stages 1-5, then the kernel contract
+#   tensorfold-vulkan-gates stages   stages 1-5 only
+#   tensorfold-vulkan-gates contract the kernel contract only
+#
+# Exit 0 when every gate passes, 1 otherwise, 2 on bad usage or a busy GPU.
+# Honeykrisp reports Mesa's vendor ID 0x10005, not Apple's PCI ID; pinning it
+# refuses any other driver. The pointwise group's one KNOWN finding (fp32
+# denormals flushed, shaderDenormPreserveFloat32=false) is not a failure.
+set -euo pipefail
+
+icd=${TENSORFOLD_VK_ICD:-/usr/share/vulkan/icd.d/asahi_icd.aarch64.json}
+vendor=${TENSORFOLD_VK_VENDOR:-0x10005}
+bin=/usr/lib/tensorfold-vulkan/bin
+lock=${TENSORFOLD_GPU_LOCK:-/tmp/m1-gpu.lock}
+
+if [[ ! -r $icd ]]; then
+  echo "tensorfold-vulkan-gates: Vulkan driver manifest not found: $icd (install vulkan-aurora)" >&2
+  exit 2
+fi
+unset VK_ICD_FILENAMES VK_ADD_DRIVER_FILES
+export VK_DRIVER_FILES=$icd
+
+mode=${1:-all}
+if [[ $mode != all && $mode != stages && $mode != contract ]]; then
+  sed -n '2,13p' "$0" >&2
+  exit 2
+fi
+
+# The per-host GPU lock the omarchy-mlx hardware tools take.
+exec 9>>"$lock"
+if ! flock -w 600 9; then
+  echo "tensorfold-vulkan-gates: GPU lock $lock stayed busy for 600 s" >&2
+  exit 2
+fi
+
+failed=0
+dev=(--vendor "$vendor" --timeout-ms 60000)
+
+run() {
+  local name=$1 rc=0
+  shift
+  echo "== $name"
+  "$@" || rc=$?
+  if (( rc == 0 )); then
+    echo "GATE $name: PASS"
+  elif (( rc == 124 )); then
+    echo "GATE $name: GPU TIMEOUT" >&2
+    failed=1
+  else
+    echo "GATE $name: FAIL (exit $rc)" >&2
+    failed=1
+  fi
+}
+
+if [[ $mode != contract ]]; then
+  for s in 1 2 3 4 5; do
+    run "stage$s" "$bin/tf-stage$s-gpu" "${dev[@]}"
+  done
+fi
+if [[ $mode != stages ]]; then
+  # Planted controls print FAIL lines by design; each runner's exit code is its verdict.
+  run contract-qmm "$bin/tf-vulkan-kernel-contract"
+  run contract-gdn "$bin/tf-vulkan-kernel-contract-gdn"
+  run contract-datamove "$bin/tf-stage1-datamove" "${dev[@]}"
+  run contract-attention "$bin/tf-attention-contract" "${dev[@]}"
+  run contract-greedy "$bin/tf-vulkan-greedy-contract" "${dev[@]}"
+  run contract-pointwise "$bin/tf-contract-pointwise" "${dev[@]}"
+fi
+
+if (( failed == 0 )); then
+  echo "TENSORFOLD VULKAN GATES ($mode): PASS"
+else
+  echo "TENSORFOLD VULKAN GATES ($mode): FAIL" >&2
+  exit 1
+fi

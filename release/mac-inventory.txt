@@ -33,5 +33,6 @@ omarchy-mlx 0.7.28-5
 omarchy-mlx-m4 none
 omarchy-steam-fex 1.0.0-4
 speakerguardd 0.1.0.aurora3-1
+tensorfold-vulkan none
 uboot-asahi 2026.07.asahi2-4
 uboot-aurora 2026.07.aurora4-1

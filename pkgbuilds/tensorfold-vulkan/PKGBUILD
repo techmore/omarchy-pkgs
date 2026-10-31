@@ -1,0 +1,133 @@
+# TensorFold's opt-in native Vulkan backend for the Mac mini M4 (J773g, T8132,
+# G16G GPU) on Aurora Honeykrisp (vulkan-aurora).
+#
+# Source: ashhart/TensorFold PR 1544 ("Native Vulkan backend for Qwen3.5-2B
+# (opt-in)"), head b3ab9ba, built as the owner's elementary M1 Pro package
+# was (techmore/ElementaryOS_MSeries mseries/local-ai/tensorfold-vulkan.sh):
+# the project's pinned Zig 0.17.0 archive, -Dvulkan=true, ReleaseSafe. The
+# engine serves one model, dense Qwen3.5-2B MLX 4-bit group 64, greedy, one
+# stream, up to 7,168 tokens. It is opt-in and experimental: upstream's own
+# fidelity packet fails on long documents (bf16 rounding near ties).
+#
+# The engine needs Vulkan 1.3, a compute queue, storageBuffer16BitAccess and
+# shaderInt16, subgroup shuffle-relative, and 30,720 bytes of shared memory;
+# Honeykrisp on G16G (aurora-wip 8990cdb219b2) gives all of them. It checks no
+# vendor or driver ID, so Aurora's Borealis driver ID needs no drirc entry.
+#
+# tensorfold-vulkan runs the server with VK_DRIVER_FILES naming the
+# vulkan-aurora manifest for its own process only; tensorfold-vulkan-gates runs
+# the operator gates and the kernel contract the same way. Neither changes
+# anything system-wide.
+pkgname=tensorfold-vulkan
+_commit=b3ab9ba217a80c63fcc48f7643ddfe339a8f4bdc
+_pr=1544
+# build.zig.zon's version at the pinned head (PR 1544 branches from main after v1.1.9).
+_tfver=1.1.9
+pkgver=$_tfver.pr$_pr.${_commit:0:7}
+pkgrel=1
+pkgdesc='TensorFold native Vulkan server for Qwen3.5-2B on Aurora Honeykrisp (upstream PR 1544)'
+arch=('aarch64')
+url="https://github.com/ashhart/TensorFold/pull/$_pr"
+license=('Apache-2.0')
+makedepends=('glslang' 'vulkan-headers')
+# A Zig-built ReleaseSafe executable; there are no C sources to split debug info from.
+options=('!debug')
+_zigver=0.17.0
+_archive=TensorFold-$_commit
+source=("$_archive.tar.gz::https://github.com/ashhart/TensorFold/archive/$_commit.tar.gz"
+        tensorfold-vulkan
+        tensorfold-vulkan-gates)
+sha256sums=('66af6b1a118b69e179ed06fc8845cf9b95eaf752addde8c63a33c198c46bf465'
+            'f4d7febfb5eec11e4ede087c183d11fc308e214b8141643e07b15d4352507fed'
+            '2ce3cd2c14a221c1ec7096701cb1a545100a99a07179c86a33971d072f56fe5e')
+source_aarch64=("https://ziglang.org/download/$_zigver/zig-aarch64-linux-$_zigver.tar.xz")
+sha256sums_aarch64=('9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8')
+
+_zig() {
+  local jobs
+  jobs=$(sed -n 's/.*-j *\([0-9][0-9]*\).*/\1/p' <<<"${MAKEFLAGS:-}")
+  ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-global-cache" \
+    ZIG_LOCAL_CACHE_DIR="$srcdir/zig-local-cache" \
+    "$srcdir/zig-$CARCH-linux-$_zigver/zig" build ${jobs:+-j$jobs} "$@"
+}
+
+prepare() {
+  local have
+  have=$("$srcdir/zig-$CARCH-linux-$_zigver/zig" version)
+  if [[ $have != "$_zigver" ]]; then
+    echo "Zig $have, expected $_zigver" >&2
+    return 1
+  fi
+  if [[ $(<"$_archive/.zig-version") != "$_zigver" ]]; then
+    echo "TensorFold pins Zig $(<"$_archive/.zig-version"), this recipe $_zigver" >&2
+    return 1
+  fi
+}
+
+build() {
+  cd "$_archive"
+  # apple_m1 is the instruction set every Apple Silicon Mac runs (upstream's
+  # macOS release targets it too); the build host's own CPU is not assumed.
+  local common=(-Dvulkan=true -Doptimize=ReleaseSafe -Dcpu=apple_m1)
+  # The server, the model probe, the stage 1-5 operator gates and the contract
+  # runners (stage1/3/5 also install datamove, attention and greedy).
+  _zig "${common[@]}" --prefix "$srcdir/out" \
+    native-vulkan vulkan-model-probe-build vulkan-probe-build \
+    stage1-gpu-build stage2-gpu-build stage3-gpu-build stage4-gpu-build stage5-gpu-build \
+    contract-pointwise-build tf-vulkan-kernel-contract
+  # The GDN contract is the same runner from another root and under the same
+  # name: its own prefix keeps it from replacing the QMM runner.
+  _zig "${common[@]}" --prefix "$srcdir/out-gdn" \
+    -Dcontract-root=zig/tests/vulkan/contract_gdn_main.zig tf-vulkan-kernel-contract
+}
+
+check() {
+  cd "$_archive"
+  # GPU-free host suites (device selection, buffer geometry, operator plans,
+  # fixtures, the engine's flag refusals). The real-checkpoint load skips
+  # without TF_QWEN_DIR.
+  _zig -Dvulkan=true \
+    vulkan-host-test qwen35-model-host-test contract-pointwise-host-test
+}
+
+package() {
+  depends=('glibc' 'vulkan-icd-loader' 'util-linux'
+           # 1:26.3.0_devel.20261031 is the first packaged aurora-wip pin with G16G.
+           'vulkan-aurora>=1:26.3.0_devel.20261031')
+
+  cd "$_archive"
+  local lib=/usr/lib/tensorfold-vulkan
+  install -Dm755 "$srcdir/out/native/bin/tensorfold-native-vulkan" "$pkgdir$lib/tensorfold-native-vulkan"
+  local exe
+  for exe in tf-qwen35-model tf-vulkan-probe tf-stage1-gpu tf-stage2-gpu tf-stage3-gpu \
+      tf-stage4-gpu tf-stage5-gpu tf-stage1-datamove tf-attention-contract \
+      tf-vulkan-greedy-contract tf-contract-pointwise tf-vulkan-kernel-contract; do
+    install -Dm755 "$srcdir/out/bin/$exe" "$pkgdir$lib/bin/$exe"
+  done
+  install -Dm755 "$srcdir/out-gdn/bin/tf-vulkan-kernel-contract" \
+    "$pkgdir$lib/bin/tf-vulkan-kernel-contract-gdn"
+  install -Dm755 "$srcdir/tensorfold-vulkan" "$pkgdir/usr/bin/tensorfold-vulkan"
+  install -Dm755 "$srcdir/tensorfold-vulkan-gates" "$pkgdir/usr/bin/tensorfold-vulkan-gates"
+
+  # What the M4 benchmark records as this engine's identity.
+  local server_sha
+  server_sha=$(sha256sum "$pkgdir$lib/tensorfold-native-vulkan" | cut -d' ' -f1)
+  install -d "$pkgdir/usr/share/tensorfold-vulkan"
+  cat >"$pkgdir/usr/share/tensorfold-vulkan/build.json" <<EOF
+{
+  "source": "https://github.com/ashhart/TensorFold",
+  "pull_request": $_pr,
+  "commit": "$_commit",
+  "version": "$_tfver",
+  "zig": "$_zigver",
+  "zig_archive_sha256": "${sha256sums_aarch64[0]}",
+  "options": ["-Dvulkan=true", "-Doptimize=ReleaseSafe", "-Dcpu=apple_m1"],
+  "server": "$lib/tensorfold-native-vulkan",
+  "server_sha256": "$server_sha",
+  "vulkan_icd": "/usr/share/vulkan/icd.d/asahi_icd.aarch64.json"
+}
+EOF
+
+  install -Dm644 LICENSE NOTICE THIRD_PARTY_NOTICES.md -t "$pkgdir/usr/share/licenses/$pkgname"
+  cp -a LICENSES "$pkgdir/usr/share/licenses/$pkgname/"
+}
