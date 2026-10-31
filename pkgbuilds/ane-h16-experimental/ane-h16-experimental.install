@@ -1,0 +1,25 @@
+post_install() {
+  cat <<'MSG'
+==> ane-h16-experimental: nothing is enabled. DKMS builds ane_h16 for each
+    kernel with headers; it never autoloads and no overlay applies until you
+    opt in. Read /usr/share/doc/ane-h16-experimental/README.md, then:
+      sudo ane-h16-experimental overlay dt    # reboot, then
+      sudo ane-h16-experimental load dt       # hardware-silent first run
+MSG
+}
+
+post_upgrade() {
+  echo "==> ane-h16-experimental: opt-in keys and stages are unchanged; see 'ane-h16-experimental status'"
+}
+
+# Without the package the overlays are gone (omarchy-mac-boot's hook rebuilds
+# m1n1 stage 2), so the opt-in keys and the firmware copy fetched by hand have
+# nothing left to serve.
+post_remove() {
+  local f=/etc/omarchy-mac-boot/dtb-overlays.opt-in
+  if [ -f "$f" ]; then
+    sed -i -e '/^ane-h16-dt$/d' -e '/^ane-h16-experimental$/d' "$f"
+  fi
+  rm -f /usr/lib/firmware/apple/ane/h16_ane_fw_leto_j7x.macho
+  rmdir /usr/lib/firmware/apple/ane 2>/dev/null || :
+}

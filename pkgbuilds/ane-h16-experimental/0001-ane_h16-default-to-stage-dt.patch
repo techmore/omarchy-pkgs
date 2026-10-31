@@ -1,0 +1,55 @@
+From 0e7a683d45e922d2e15657f923d6981982daeded Mon Sep 17 00:00:00 2001
+From: techmore <sdolbec1@gmail.com>
+Date: Sat, 31 Oct 2026 10:28:54 -0400
+Subject: [PATCH] ane_h16: default to stage=dt, the stage that touches no MMIO
+
+A module load without stage= ran stage=status, which powers the five ANE
+domains and reads the engine window. Make the default the hardware-silent
+DT parse, so only an explicit stage=status or stage=boot touches the ANE.
+---
+ ane_h16_main.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/ane_h16_main.c b/ane_h16_main.c
+index f57d72b..147add0 100644
+--- a/ane_h16_main.c
++++ b/ane_h16_main.c
+@@ -7,12 +7,12 @@
+  *
+  * Three stages, selected by the "stage" module parameter:
+  *
+- *   stage=dt: parse the running DT (engine/pmgr windows from the soc
++ *   stage=dt (default): parse the running DT (engine/pmgr windows from the soc
+  *   row, ps word offsets, the firmware pin) and print the word groups
+  *   with their evidence tier. No MMIO access of any kind: the first
+  *   run on a volunteer machine is hardware-silent.
+  *
+- *   stage=status (default): enable the ANE power domains named in the
++ *   stage=status: enable the ANE power domains named in the
+  *   device node, wait until every pmgr ANE state word reads ACTUAL=0xf
+  *   (the standing rule from the T6021 program: never touch the engine
+  *   window before that), then log RVBAR, CPU_STATUS, SCRATCH0..7 and
+@@ -35,6 +35,7 @@
+  *
+  * The module refuses to probe unless its opt-in key is set:
+  *   insmod ane_h16.ko optin=t8132 stage=status
++ * Without stage= it runs stage=dt, which touches no MMIO.
+  * There is no MODULE_DEVICE_TABLE, so nothing autoloads it.
+  *
+  * After stage=boot starts the firmware the module must not be unloaded;
+@@ -73,10 +74,10 @@ module_param(optin, charp, 0444);
+ MODULE_PARM_DESC(optin,
+ 		 "Opt-in key: must equal the SoC row name (t8132, t6040, t6041, ...) or probe returns -EPERM.");
+ 
+-static char *stage = "status";
++static char *stage = "dt";
+ module_param(stage, charp, 0444);
+ MODULE_PARM_DESC(stage,
+-		 "dt/0: parse the DT and print word groups, no MMIO. status/1 (default): power up and log registers only. boot/3: firmware-boot smoke (EXPERIMENTAL). 2 is not an H16 module stage (the ladder's fw-pin step runs in userspace).");
++		 "dt/0 (default): parse the DT and print word groups, no MMIO. status/1: power up and log registers only. boot/3: firmware-boot smoke (EXPERIMENTAL). 2 is not an H16 module stage (the ladder's fw-pin step runs in userspace).");
+ 
+ static unsigned int ps_wait_ms = 500;
+ module_param(ps_wait_ms, uint, 0444);
+-- 
+2.50.1 (Apple Git-155)
+

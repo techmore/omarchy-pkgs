@@ -13,6 +13,7 @@
 # A new Mac recipe belongs here before its first promotion, as `none` until
 # it is qualified: a pkgbase this file does not list is not checked.
 alsa-ucm-conf-aurora 10.aurora2-2
+ane-h16-experimental none
 aura 0.1.0.r20261023-1
 aurora-audio 4.1.aurora3-3
 aurora-bless 0.4.4.aurora2-1

@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/*
+ * ane-h16-experimental, overlay 1 of 2: the ANE node alone, for ane_h16
+ * stage=dt and stage=status on the Mac mini M4 (J773g, T8132).
+ *
+ * Applied only when /etc/omarchy-mac-boot/dtb-overlays.opt-in has the
+ * line "ane-h16-dt" (omarchy-mac-boot dtb-overlays.sh), and skipped once
+ * the kernel's own device tree has an apple,t8132-ane node.
+ *
+ * No DART nodes and no iommus: nothing built into the kernel binds to
+ * this node, and with five power-domains the platform core attaches none
+ * of them, so the overlay alone powers nothing and touches no register.
+ * ane_h16 stage=boot needs the DARTs: that is overlay 2,
+ * t8132-j773g-ane-h16-full.dts.
+ *
+ * Every value checked against the J773g ADT (/arm-io/ane, arm-io offset
+ * 0x200000000; pmgr power states):
+ *   reg[0] engine 0x300000000+0x2000000 -> 0x500000000
+ *   reg[1] pmgr   0x180700000+0x18000   -> 0x380700000
+ *   interrupts 629, 642; ane-type 256 (0x100)
+ *   ANE_SYS +0x570, ANE_MPM/CPU/TD +0xc000/+0xc008/+0xc010 (parent
+ *   ANE_SYS), ANE_BASE +0xc018 (parent ANE_TD)
+ * Based on joshuaswarren/omarchy-ane v0.5.7 ane/h16/t8132-ane-experimental.dts;
+ * the AIC target path is the one this kernel's t8132.dtsi uses
+ * (interrupt-controller@381000000, ADT /arm-io/aic 0x181000000).
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	omarchy,opt-in = "ane-h16-dt";
+	omarchy,skip-if-compatible = "apple,t8132-ane";
+
+	fragment@0 {
+		target-path = "/soc/interrupt-controller@381000000";
+		aic: __overlay__ {
+		};
+	};
+
+	fragment@1 {
+		target-path = "/soc/power-management@380700000/power-controller@570";
+		ps_ane_sys: __overlay__ {
+		};
+	};
+
+	fragment@2 {
+		target-path = "/soc/power-management@380700000/power-controller@c000";
+		ps_ane_mpm: __overlay__ {
+		};
+	};
+
+	fragment@3 {
+		target-path = "/soc/power-management@380700000/power-controller@c008";
+		ps_ane_cpu: __overlay__ {
+		};
+	};
+
+	fragment@4 {
+		target-path = "/soc/power-management@380700000/power-controller@c010";
+		ps_ane_td: __overlay__ {
+		};
+	};
+
+	fragment@5 {
+		target-path = "/soc/power-management@380700000/power-controller@c018";
+		ps_ane_base: __overlay__ {
+		};
+	};
+
+	fragment@6 {
+		target-path = "/soc";
+
+		__overlay__ {
+			ane@500000000 {
+				compatible = "apple,t8132-ane";
+				reg-names = "engine", "pmgr";
+				reg = <0x5 0x00000000 0x0 0x2000000>,
+				      <0x3 0x80700000 0x0 0x18000>;
+				interrupt-parent = <&aic>;
+				interrupts = <0 629 4>, <0 642 4>;
+				power-domains = <&ps_ane_sys>, <&ps_ane_mpm>,
+						<&ps_ane_cpu>, <&ps_ane_td>,
+						<&ps_ane_base>;
+				apple,ane-type = <0x100>;
+				status = "okay";
+			};
+		};
+	};
+};

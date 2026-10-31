@@ -1,0 +1,224 @@
+#!/bin/bash
+# ane-h16-experimental: opt in to the experimental Mac mini M4 (J773g, T8132)
+# Neural Engine bring-up one step at a time. See
+# /usr/share/doc/ane-h16-experimental/README.md.
+
+set -euo pipefail
+
+readonly OPT_IN=/etc/omarchy-mac-boot/dtb-overlays.opt-in
+readonly OVERLAY_DIR=/usr/lib/omarchy-mac-boot/dtb-overlays/t8132-j773g
+readonly OVERLAY_LIB=/usr/lib/omarchy-mac/boot/dtb-overlays.sh
+readonly KEY_DT=ane-h16-dt
+readonly KEY_FULL=ane-h16-experimental
+readonly NODE=/proc/device-tree/soc/ane@500000000
+readonly DARTS=/proc/device-tree/soc/iommu@501800000
+readonly FW=/usr/lib/firmware/apple/ane/h16_ane_fw_leto_j7x.macho
+readonly FETCH=/usr/lib/ane-h16-experimental/omarchy-ane-firmware-fetch
+readonly DOC=/usr/share/doc/ane-h16-experimental/README.md
+
+die() {
+  echo "ane-h16-experimental: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+Usage: ane-h16-experimental COMMAND
+
+  status              What is opted in, what the running device tree has,
+                      whether ane_h16 is built/loaded, and its last RESULT lines.
+  overlay dt          Opt in to the ANE node alone (key $KEY_DT). Needed for
+                      stage=dt and stage=status. Touches no hardware by itself.
+  overlay full        Opt in to the ANE node and its three DARTs (key
+                      $KEY_FULL). Needed for stage=boot. apple-dart then
+                      probes the ANE DARTs on every boot.
+  overlay off         Opt out: remove both keys. Takes effect after a reboot.
+  load dt             Load ane_h16 at stage=dt: DT parse only, no MMIO.
+  load status         Power the five ANE domains, read registers, power off.
+  load boot [--hello] --reboot-is-ok
+                      EXPERIMENTAL firmware-boot smoke. Cannot be undone
+                      without a reboot once the firmware starts.
+  unload              Unload ane_h16 (refused by the module after stage=boot).
+  firmware            Fetch and pin-check the M4 ANE firmware from Apple's
+                      macOS 27.0 restore image (for stage=boot only).
+  log                 ane_h16 kernel messages from this boot.
+
+Stages run one at a time and each needs a reboot after a change of overlay.
+Read $DOC first.
+EOF
+}
+
+need_root() {
+  (( EUID == 0 )) || die "run this as root (sudo ane-h16-experimental $*)"
+}
+
+is_j773g() {
+  [[ -r /proc/device-tree/compatible ]] &&
+    tr '\0' '\n' </proc/device-tree/compatible | grep -qx 'apple,j773g'
+}
+
+has_key() {
+  [[ -r $OPT_IN ]] && grep -Fqx -- "$1" "$OPT_IN"
+}
+
+node_compatible() {
+  [[ -r $1/compatible ]] && tr '\0' ' ' <"$1/compatible"
+}
+
+module_loaded() {
+  [[ -d /sys/module/ane_h16 ]]
+}
+
+kernel_log() {
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -k -b -o cat --no-pager 2>/dev/null | grep -F 'ane_h16' || :
+  else
+    dmesg 2>/dev/null | grep -F 'ane_h16' || :
+  fi
+}
+
+# stage=boot touched the ANE CPU this boot (ane_h16 sets fw_touched right
+# after these RVBAR lines): only a reboot parks it again.
+firmware_started() {
+  kernel_log | grep -Eq 'RVBAR unlatched; writing|RVBAR latched at the staged entry|firmware started|firmware released'
+}
+
+cmd_status() {
+  local model=unknown key
+  [[ -r /proc/device-tree/model ]] && model=$(tr -d '\0' </proc/device-tree/model)
+  echo "machine:        $model$(is_j773g && echo ' (J773g)' || echo ' (not J773g: this package does nothing here)')"
+  echo "kernel:         $(uname -r)"
+  if command -v dkms >/dev/null 2>&1; then
+    echo "dkms:           $(dkms status ane-h16-experimental 2>/dev/null | tr '\n' ';' || :)"
+  fi
+  if modinfo -n ane_h16 >/dev/null 2>&1; then
+    echo "module:         $(modinfo -n ane_h16) (vermagic $(modinfo -F vermagic ane_h16))"
+  else
+    echo "module:         not built for $(uname -r) (install linux-aurora-headers, then: sudo dkms autoinstall)"
+  fi
+  echo "loaded:         $(module_loaded && echo yes || echo no)"
+  for key in "$KEY_DT" "$KEY_FULL"; do
+    echo "opt-in $key: $(has_key "$key" && echo listed || echo 'not listed')"
+  done
+  if [[ -d $NODE ]]; then
+    echo "running DT:     $NODE present ($(node_compatible "$NODE"))"
+  else
+    echo "running DT:     no ANE node (no overlay applied this boot)"
+  fi
+  [[ -d $DARTS ]] && echo "running DT:     ANE DARTs present (overlay full): apple-dart owns them this boot"
+  if [[ -f $FW ]]; then
+    echo "firmware:       $FW present ($(sha256sum "$FW" | cut -c1-16)...)"
+  else
+    echo "firmware:       not installed (only stage=boot needs it)"
+  fi
+  echo "last RESULT:"
+  kernel_log | grep -F 'RESULT' | tail -n 5 | sed 's/^/  /' || :
+}
+
+set_overlay() {
+  local want=$1 tmp
+  need_root overlay "$want"
+  is_j773g || die "this is not a Mac mini M4 (J773g); refusing"
+  [[ -r $OVERLAY_LIB ]] ||
+    die "$OVERLAY_LIB is missing: this image does not apply omarchy-mac-boot overlays. See $DOC, 'Without omarchy-mac-boot'."
+  [[ -f $OVERLAY_DIR/omarchy-ane-h16-dt.dtbo && -f $OVERLAY_DIR/omarchy-ane-h16-full.dtbo ]] ||
+    die "the overlays are missing from $OVERLAY_DIR; reinstall ane-h16-experimental"
+  mkdir -p "${OPT_IN%/*}"
+  touch "$OPT_IN"
+  tmp=$(mktemp "${OPT_IN}.XXXXXX")
+  grep -Fvx -e "$KEY_DT" -e "$KEY_FULL" "$OPT_IN" >"$tmp" || :
+  case $want in
+    dt) echo "$KEY_DT" >>"$tmp" ;;
+    full) echo "$KEY_FULL" >>"$tmp" ;;
+    off) ;;
+  esac
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$OPT_IN"
+  echo "opt-in file now lists: $(grep -Fx -e "$KEY_DT" -e "$KEY_FULL" "$OPT_IN" | tr '\n' ' ' || :)"
+  if command -v update-m1n1 >/dev/null 2>&1; then
+    echo "rebuilding m1n1 stage 2 (update-m1n1)..."
+    update-m1n1
+  else
+    die "update-m1n1 not found; the change applies when m1n1 stage 2 is next rebuilt"
+  fi
+  echo "Reboot to apply. If the Mac does not come back, see $DOC, 'Recovery'."
+}
+
+cmd_overlay() {
+  case ${1:-} in
+    dt | full | off) set_overlay "$1" ;;
+    *) die "overlay takes dt, full or off" ;;
+  esac
+}
+
+cmd_unload() {
+  need_root unload
+  module_loaded || { echo "ane_h16 is not loaded"; return 0; }
+  if firmware_started; then
+    die "ane_h16 released the ANE firmware this boot; it must stay loaded. Reboot instead."
+  fi
+  modprobe -r ane_h16
+  echo "ane_h16 unloaded"
+}
+
+cmd_load() {
+  local stage=${1:-} hello=0 ok=0 arg
+  shift || :
+  for arg in "$@"; do
+    case $arg in
+      --hello) hello=1 ;;
+      --reboot-is-ok) ok=1 ;;
+      *) die "unknown option $arg" ;;
+    esac
+  done
+  case $stage in
+    dt | status | boot) ;;
+    *) die "load takes dt, status or boot" ;;
+  esac
+  need_root load "$stage"
+  is_j773g || die "this is not a Mac mini M4 (J773g); refusing"
+  [[ -d $NODE ]] ||
+    die "the running device tree has no ANE node. Run 'sudo ane-h16-experimental overlay dt' (or full for stage=boot) and reboot first."
+  modinfo -n ane_h16 >/dev/null 2>&1 ||
+    die "ane_h16 is not built for $(uname -r); install linux-aurora-headers and run 'sudo dkms autoinstall'"
+  if [[ $stage == boot ]]; then
+    [[ -d $DARTS ]] || die "stage=boot needs the ANE DARTs: 'sudo ane-h16-experimental overlay full', then reboot"
+    [[ -f $FW ]] || die "stage=boot needs the firmware: 'sudo ane-h16-experimental firmware'"
+    (( ok )) || die "stage=boot can leave the ANE running until a reboot and may hang the Mac. Re-run with --reboot-is-ok once you have read $DOC."
+  fi
+  if module_loaded; then
+    firmware_started && die "the firmware was started this boot; reboot before another stage"
+    modprobe -r ane_h16
+  fi
+  local params=(optin=t8132 "stage=$stage")
+  (( hello )) && params+=(hello_wait_ms=1000)
+  echo "modprobe ane_h16 ${params[*]}"
+  # probe failures come back as a module that loads but does not bind.
+  modprobe ane_h16 "${params[@]}" || :
+  sleep 1
+  kernel_log | tail -n 40
+}
+
+cmd_firmware() {
+  need_root firmware
+  is_j773g || die "this is not a Mac mini M4 (J773g); refusing"
+  command -v python3 >/dev/null 2>&1 || die "install python first"
+  python3 -I "$FETCH"
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || :
+  case $cmd in
+    status) cmd_status ;;
+    overlay) cmd_overlay "$@" ;;
+    load) cmd_load "$@" ;;
+    unload) cmd_unload ;;
+    firmware) cmd_firmware ;;
+    log) kernel_log ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

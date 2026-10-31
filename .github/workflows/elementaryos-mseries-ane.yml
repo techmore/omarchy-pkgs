@@ -1,0 +1,96 @@
+name: Build elementaryos-mseries-ane packages
+
+# Fork-only: build pkgbuilds/ane-h16-experimental (the opt-in M4 ANE bring-up
+# module for the Mac mini M4, J773g) on every push to elementaryos-mseries-ane,
+# the way elementaryos-mseries.yml builds the platform packages: bin/build in
+# the omarchy-pkg-builder container against the edge mirror, natively on
+# GitHub's arm64 runner, with the makepkg output uploaded as an artifact.
+#
+# The recipe's check() builds the module with DKMS against the installed
+# linux-aurora-headers. To build it against the kernel this branch targets,
+# the job seeds the build workspace with linux-aurora-headers from the newest
+# elementaryos-mseries.yml artifact (or the run named on dispatch); without
+# one it falls back to the edge channel's headers and says so.
+#
+# Signing: nothing here signs, as in elementaryos-mseries.yml. The artifact is
+# an unsigned candidate.
+on:
+  push:
+    branches: [elementaryos-mseries-ane]
+    paths:
+      - pkgbuilds/ane-h16-experimental/**
+      - .github/workflows/elementaryos-mseries-ane.yml
+  workflow_dispatch:
+    inputs:
+      kernel_run:
+        description: "elementaryos-mseries.yml run id whose linux-aurora artifact to build against (empty: the newest one)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: elementaryos-mseries-ane-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (ane-h16-experimental, aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Seed linux-aurora-headers from the elementaryos-mseries kernel build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_RUN: ${{ github.event.inputs.kernel_run }}
+        run: |
+          set -euo pipefail
+          out=build-output/edge/aarch64
+          mkdir -p "$out"
+          run=$KERNEL_RUN
+          if [[ -z $run ]]; then
+            run=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.name | startswith("linux-aurora-aarch64-")) | select(.expired | not) | "\(.created_at) \(.workflow_run.id)"' \
+              | sort -r | awk 'NR == 1 {print $2}')
+          fi
+          if [[ -z $run ]]; then
+            echo "::warning::No linux-aurora artifact from elementaryos-mseries.yml: the DKMS check builds against the edge channel's linux-aurora-headers, not the J773g kernel."
+            exit 0
+          fi
+          echo "Seeding from run $run"
+          gh run download "$run" -R "$GITHUB_REPOSITORY" --pattern 'linux-aurora-aarch64-*' -D kernel-artifact
+          mkdir -p kernel-pkgs
+          find kernel-artifact -name packages.tar -exec tar -xf {} -C kernel-pkgs \;
+          shopt -s nullglob
+          headers=(kernel-pkgs/linux-aurora-headers-*.pkg.tar.zst)
+          (( ${#headers[@]} == 1 )) || { echo "::error::run $run has ${#headers[@]} linux-aurora-headers packages"; exit 1; }
+          cp -- "${headers[0]}" "$out/"
+          echo "OMARCHY_KEEP_BUILD_WORKSPACE=1" >> "$GITHUB_ENV"
+          echo "Seeded ${headers[0]##*/}"
+      - name: Build ane-h16-experimental (aarch64)
+        env:
+          CONTAINER_ENGINE: docker
+          OMARCHY_BUILD_JOBS: 4
+        run: bin/build --mirror edge --arch aarch64 --package ane-h16-experimental
+      - name: Pack artifact
+        run: |
+          set -euo pipefail
+          mkdir -p upload/pkgs
+          cp -- build-output/edge/aarch64/ane-h16-experimental-*.pkg.tar.zst upload/pkgs/
+          source helpers/artifact-helpers.sh
+          pack_packages upload/pkgs upload/packages.tar
+          rm -rf upload/pkgs
+          tar -tvf upload/packages.tar
+          (cd build-output/edge/aarch64 && sha256sum -- ane-h16-experimental-*.pkg.tar.zst) | tee upload/SHA256SUMS
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ane-h16-experimental-aarch64-${{ github.sha }}
+          path: upload/
+          if-no-files-found: error
+          retention-days: 30

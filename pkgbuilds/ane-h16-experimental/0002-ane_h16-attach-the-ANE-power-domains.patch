@@ -1,0 +1,227 @@
+From ebd7874a8fc890590797c751d0b8bb52cb8f630c Mon Sep 17 00:00:00 2001
+From: techmore <sdolbec1@gmail.com>
+Date: Sat, 31 Oct 2026 10:29:38 -0400
+Subject: [PATCH] ane_h16: attach the five ANE power domains for stage=status
+ and boot
+
+The T8132 node lists five power-domains (ANE_SYS, ANE_MPM, ANE_CPU,
+ANE_TD, ANE_BASE). The platform core attaches a power domain only when a
+node lists exactly one, so pm_runtime_get_sync() powered nothing and
+stage=status could only end in FAIL pmgr-actual-stuck. Attach each
+domain by index and link it for runtime PM, as ane_h15 does, and drop
+them again on a failed probe or on remove. stage=dt returns before this
+and stays free of MMIO.
+
+Now that the probe's pm_runtime_put_sync() really powers the ANE off,
+skip it once stage=boot has touched the firmware (RVBAR written or the
+CPU released), as remove() already keeps the power on in that case.
+
+The sim shim gains no-op stubs; its scenarios list no power-domains, so
+every scenario runs as before.
+---
+ ane_h16_main.c            | 87 ++++++++++++++++++++++++++++++++++++++-
+ sim/inc/linux/pm_domain.h |  2 +
+ sim/shim.h                | 35 ++++++++++++++++
+ 3 files changed, 123 insertions(+), 1 deletion(-)
+ create mode 100644 sim/inc/linux/pm_domain.h
+
+diff --git a/ane_h16_main.c b/ane_h16_main.c
+index 147add0..db85d15 100644
+--- a/ane_h16_main.c
++++ b/ane_h16_main.c
+@@ -62,6 +62,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/sizes.h>
+ #include <linux/string.h>
+@@ -160,8 +161,73 @@ struct ane_h16 {
+ 	dma_addr_t stage_dma;
+ 	size_t stage_size;
+ 	struct iommu_domain *domain;
++	/* The node lists five power-domains. The platform core attaches
++	 * only a single one, so each is attached here and linked for
++	 * runtime PM, as ane_h15 does. */
++#define ANE_H16_MAX_PD 8
++	struct device *pd_dev[ANE_H16_MAX_PD];
++	struct device_link *pd_link[ANE_H16_MAX_PD];
++	int pd_count;
+ };
+ 
++/* Attach every power-domain the node lists and link it, so one
++ * pm_runtime_get on this device powers them all. Returns 0 when the
++ * node has 0 or 1 domains (the core's automatic attach covers those).
++ */
++static int ane_h16_attach_pds(struct ane_h16 *ane)
++{
++	struct device *dev = ane->dev;
++	int count, i;
++
++	count = of_count_phandle_with_args(dev->of_node, "power-domains",
++					   "#power-domain-cells");
++	if (count <= 1)
++		return 0;
++	if (count > ANE_H16_MAX_PD) {
++		dev_err(dev, "too many power-domains: %d\n", count);
++		return -EINVAL;
++	}
++	for (i = 0; i < count; i++) {
++		ane->pd_dev[i] = dev_pm_domain_attach_by_id(dev, i);
++		if (IS_ERR_OR_NULL(ane->pd_dev[i])) {
++			int err = ane->pd_dev[i] ? PTR_ERR(ane->pd_dev[i]) : -ENODEV;
++
++			ane->pd_dev[i] = NULL;
++			dev_err(dev, "attach power-domain %d: %d\n", i, err);
++			return err;
++		}
++		/* Counted before the link, so detach still drops this
++		 * domain when device_link_add fails. */
++		ane->pd_count = i + 1;
++		ane->pd_link[i] = device_link_add(dev, ane->pd_dev[i],
++						  DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME |
++						  DL_FLAG_RPM_ACTIVE);
++		if (!ane->pd_link[i]) {
++			dev_err(dev, "link power-domain %d\n", i);
++			return -EINVAL;
++		}
++	}
++	dev_info(dev, "attached %d ANE power-domains\n", ane->pd_count);
++	return 0;
++}
++
++static void ane_h16_detach_pds(struct ane_h16 *ane)
++{
++	int i;
++
++	for (i = ane->pd_count - 1; i >= 0; i--) {
++		if (ane->pd_link[i]) {
++			device_link_del(ane->pd_link[i]);
++			ane->pd_link[i] = NULL;
++		}
++		if (ane->pd_dev[i]) {
++			dev_pm_domain_detach(ane->pd_dev[i], true);
++			ane->pd_dev[i] = NULL;
++		}
++	}
++	ane->pd_count = 0;
++}
++
+ /* ---- pmgr state words (the read-only-after-ACTUAL=0xf rule) ---- */
+ 
+ /* apple-pmgr-pwrstate word: TARGET bits 3:0, ACTUAL bits 7:4; 0xf is
+@@ -1092,11 +1158,19 @@ static int ane_h16_probe(struct platform_device *pdev)
+ 	if (IS_ERR(ane->pmgr))
+ 		return PTR_ERR(ane->pmgr);
+ 
++	ret = ane_h16_attach_pds(ane);
++	if (ret) {
++		ane_h16_detach_pds(ane);
++		ane_h16_result(ane, stage_idx, "FAIL", "pd-attach");
++		return ret;
++	}
+ 	pm_runtime_enable(&pdev->dev);
+ 	ret = pm_runtime_get_sync(&pdev->dev);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "power-domains bring-up failed: %d\n", ret);
++		pm_runtime_put_noidle(&pdev->dev);
+ 		pm_runtime_disable(&pdev->dev);
++		ane_h16_detach_pds(ane);
+ 		return ret;
+ 	}
+ 	ret = ane_h16_ps_wait(ane);
+@@ -1114,10 +1188,20 @@ static int ane_h16_probe(struct platform_device *pdev)
+ 	}
+ 	ret = ane_h16_boot(ane);
+ rpm_off:
+-	pm_runtime_put_sync(&pdev->dev);
++	/* With the domains attached, this put powers them off. Once the
++	 * firmware was touched keep them on, as remove() does: powering
++	 * the ANE off under a released CPU is untested. */
++	if (!ane->fw_touched)
++		pm_runtime_put_sync(&pdev->dev);
+ 	if (ane->fw_started)
+ 		dev_emerg(&pdev->dev,
+ 			  "firmware started: do NOT unload this module; reboot to park the ANE\n");
++	/* A failed probe is never removed: drop the domains here, unless
++	 * the firmware was touched, which keeps them on until a reboot. */
++	if (ret && !ane->fw_touched) {
++		pm_runtime_disable(&pdev->dev);
++		ane_h16_detach_pds(ane);
++	}
+ 	return ret;
+ }
+ 
+@@ -1132,6 +1216,7 @@ static void ane_h16_remove(struct platform_device *pdev)
+ 		return;
+ 	}
+ 	pm_runtime_disable(&pdev->dev);
++	ane_h16_detach_pds(ane);
+ }
+ 
+ static const struct of_device_id ane_h16_of_match[] = {
+diff --git a/sim/inc/linux/pm_domain.h b/sim/inc/linux/pm_domain.h
+new file mode 100644
+index 0000000..01f01ef
+--- /dev/null
++++ b/sim/inc/linux/pm_domain.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* fake kernel header for the userspace sim; real content lives in shim.h */
+diff --git a/sim/shim.h b/sim/shim.h
+index c7b77b8..0d580b2 100644
+--- a/sim/shim.h
++++ b/sim/shim.h
+@@ -54,6 +54,7 @@ typedef unsigned long long dma_addr_t;
+ #define IS_ERR(p) ((unsigned long)(p) > (unsigned long)-4096L)
+ #define PTR_ERR(p) ((long)(p))
+ #define ERR_PTR(e) ((void *)(long)(e))
++#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
+ 
+ /* ---- fake MMIO bus ---- */
+ struct sim_region {
+@@ -399,6 +400,40 @@ static inline void pm_runtime_put_sync(struct device *dev)
+ 	sim_rpm_puts++;
+ }
+ static inline void pm_runtime_get_noresume(struct device *dev) { (void)dev; }
++static inline void pm_runtime_put_noidle(struct device *dev) { (void)dev; }
++
++/* ---- multi power-domain attach: the scenarios' node lists none, so
++ * of_count_phandle_with_args returns 0 and ane_h16_attach_pds is a
++ * no-op; the stubs exist so the module source compiles unchanged. ---- */
++struct device_link { int unused; };
++#define DL_FLAG_STATELESS	(1u << 0)
++#define DL_FLAG_PM_RUNTIME	(1u << 2)
++#define DL_FLAG_RPM_ACTIVE	(1u << 3)
++static inline int of_count_phandle_with_args(struct device_node *np,
++					     const char *list,
++					     const char *cells)
++{
++	(void)np; (void)list; (void)cells;
++	return 0;
++}
++static inline struct device *dev_pm_domain_attach_by_id(struct device *dev,
++							 unsigned int index)
++{
++	(void)dev; (void)index;
++	return NULL;
++}
++static inline void dev_pm_domain_detach(struct device *dev, bool power_off)
++{
++	(void)dev; (void)power_off;
++}
++static inline struct device_link *device_link_add(struct device *consumer,
++						  struct device *supplier,
++						  u32 flags)
++{
++	(void)consumer; (void)supplier; (void)flags;
++	return NULL;
++}
++static inline void device_link_del(struct device_link *link) { (void)link; }
+ 
+ /* ---- DMA ---- */
+ extern int sim_dma_outstanding;
+-- 
+2.50.1 (Apple Git-155)
+

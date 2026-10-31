@@ -1,0 +1,179 @@
+# Maintainer: techmore <sdolbec1@gmail.com>
+#
+# Opt-in, experimental: the H16 (M4, T8132) ANE bring-up module from
+# joshuaswarren/omarchy-ane ane/h16 as DKMS source, for the Mac mini M4
+# (J773g) on the techmore elementaryos-mseries kernel. Nothing runs on
+# install: the module never autoloads, and both overlays carry an
+# omarchy,opt-in key. README.md has the stages and what can go wrong.
+#
+# Not in omarchy-platform-apple-silicon: an M4 image installs it by name, and
+# release/mac-inventory.txt lists it as none so it never leaves edge.
+
+pkgname=ane-h16-experimental
+_srcname=omarchy-ane
+pkgver=0.5.7
+pkgrel=1
+pkgdesc='EXPERIMENTAL opt-in Apple Neural Engine bring-up module (ane_h16, DKMS) and overlays for the Mac mini M4 (J773g)'
+arch=('aarch64')
+url='https://github.com/joshuaswarren/omarchy-ane'
+license=('GPL-2.0-only OR MIT')
+# dtc 1.7.1 is the first fdtoverlay that keeps a labelled node's phandle,
+# which both overlays rely on (the base device trees carry no __symbols__).
+depends=('dkms' 'linux-aurora-headers' 'dtc>=1:1.7.1')
+optdepends=('omarchy-mac-boot: applies the overlays once their opt-in key is listed'
+            'python: ane-h16-experimental firmware (stage=boot only)')
+# omarchy-mac-boot reads package-owned overlays from 20261004-2 on.
+conflicts=('omarchy-mac-boot<20261004-2')
+makedepends=('dtc')
+checkdepends=('dkms' 'fakeroot' 'linux-aurora-headers' 'dtc' 'kmod')
+install=$pkgname.install
+
+# The kernel commit linux-aurora pins (techmore/linux-m1pro-touchid
+# elementaryos-mseries). check() compiles its J773g device tree and applies
+# both overlays to it; nothing from it is packaged.
+_kcommit=fa26b0f92ef60a9d2ee5fae2d49a7dd12ee2473e
+_kurl=https://github.com/techmore/linux-m1pro-touchid
+
+source=("$_srcname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "linux-${_kcommit}.tar.gz::$_kurl/archive/${_kcommit}.tar.gz"
+        0001-ane_h16-default-to-stage-dt.patch
+        0002-ane_h16-attach-the-ANE-power-domains.patch
+        t8132-j773g-ane-h16-dt.dts
+        t8132-j773g-ane-h16-full.dts
+        dkms.conf
+        ane-h16-experimental
+        ane-h16-experimental.modprobe.conf
+        README.md)
+noextract=("linux-${_kcommit}.tar.gz")
+sha256sums=('304d5768697d0b707da5e24478bd80003eddbe476f5e411be4fcf65f020f18c6'
+            'e0308ca1560b9c623d20fe598a89a195c9095e0926e7e87a0fe06b8c40741e82'
+            '0c7c5fdfcdf2c9c3d6f457fe347823b6b6107b4b6b89995c65bb44c3b6e7bfdb'
+            '372faac6f51f0c72abf5440206c4189216be3eaed7fe8293b63357aa4644fbee'
+            'e921004793ae91ccd1cd5df0d0a5a2a7182269d01fab21b5065830b94fe241ca'
+            '91750923cfad5b3d1771a9ec26e82d069f97703734ac4a41312fc156cdfb0d2c'
+            '1004ff5cb9b1ce6c5a4b05ec5e93b64971362693eb30bd28a21bcae6d7e58f55'
+            '3983c979b5b65125266ad32d63a5abc741e5453dfad3834489e878d6d54bcf4b'
+            '6acb2b25aebe214437a60b5c446b4bc126ecf064c7b5fd9b0ea9e8ea16eda145'
+            'e1c737a2e0b76294b911cded10b273ca3e8331c9f86237e26269c0d521131fef')
+
+prepare() {
+  rm -rf h16
+  cp -r "$_srcname-$pkgver/ane/h16" h16
+  local p
+  for p in 0001-ane_h16-default-to-stage-dt.patch 0002-ane_h16-attach-the-ANE-power-domains.patch; do
+    echo "Applying $p..."
+    patch -d h16 -Np1 <"$p"
+  done
+  grep -qx 'static char \*stage = "dt";' h16/ane_h16_main.c
+
+  # The DKMS source tree: dkms.conf, the kbuild Makefile and the module source.
+  rm -rf dkms
+  install -d "dkms/$pkgname-$pkgver"
+  cp h16/Makefile h16/ane_h16.h h16/ane_h16_main.c h16/ane_h16_soc.c "dkms/$pkgname-$pkgver/"
+  sed "s/@PKGVER@/$pkgver/" dkms.conf >"dkms/$pkgname-$pkgver/dkms.conf"
+}
+
+build() {
+  local o
+  for o in dt full; do
+    dtc -q -@ -I dts -O dtb -o "omarchy-ane-h16-$o.dtbo" "t8132-j773g-ane-h16-$o.dts"
+  done
+}
+
+check() {
+  bash -n ane-h16-experimental
+
+  # Upstream's userspace simulation of the patched module: stage dispatch,
+  # the power-state guard, the firmware pin and preload gates, the boot
+  # state machine, and mutations the harness must catch.
+  make -C h16 sim
+
+  # Both overlays carry their opt-in key and the skip-if-compatible guard.
+  local o key
+  for o in dt full; do
+    key=$(fdtget -t s "omarchy-ane-h16-$o.dtbo" / omarchy,opt-in)
+    case $o in
+      dt) [[ $key == ane-h16-dt ]] ;;
+      full) [[ $key == ane-h16-experimental ]] ;;
+    esac || { echo "check: $o overlay has opt-in key '$key'" >&2; return 1; }
+    [[ $(fdtget -t s "omarchy-ane-h16-$o.dtbo" / omarchy,skip-if-compatible) == apple,t8132-ane ]] ||
+      { echo "check: $o overlay lacks skip-if-compatible" >&2; return 1; }
+  done
+
+  # Both apply to the J773g device tree of the pinned kernel, and every
+  # reference resolves to the node the J773g ADT names.
+  local kt=$srcdir/kernel-dts top=linux-m1pro-touchid-${_kcommit}
+  rm -rf "$kt"
+  mkdir -p "$kt"
+  bsdtar -xf "linux-${_kcommit}.tar.gz" -C "$kt" --strip-components 1 \
+    "$top/arch/arm64/boot/dts/apple" "$top/include/dt-bindings"
+  cpp -nostdinc -undef -D__DTS__ -x assembler-with-cpp -P \
+    -I "$kt/include" -I "$kt/arch/arm64/boot/dts/apple" \
+    "$kt/arch/arm64/boot/dts/apple/t8132-j773g.dts" -o "$kt/j773g.pre"
+  dtc -q -I dts -O dtb -o "$kt/t8132-j773g.dtb" "$kt/j773g.pre"
+  for o in dt full; do
+    fdtoverlay -i "$kt/t8132-j773g.dtb" -o "$kt/j773g-$o.dtb" "omarchy-ane-h16-$o.dtbo"
+    dtc -q -I dtb -O dtb -o /dev/null "$kt/j773g-$o.dtb"
+    [[ $(fdtget -t s "$kt/j773g-$o.dtb" /soc/ane@500000000 compatible) == apple,t8132-ane ]]
+    [[ $(fdtget -t x "$kt/j773g-$o.dtb" /soc/ane@500000000 apple,ane-type) == 100 ]]
+    _check_phandle "$kt/j773g-$o.dtb" /soc/ane@500000000 interrupt-parent 0 \
+      /soc/interrupt-controller@381000000
+    local i=0 ps
+    for ps in 570 c000 c008 c010 c018; do
+      _check_phandle "$kt/j773g-$o.dtb" /soc/ane@500000000 power-domains $i \
+        "/soc/power-management@380700000/power-controller@$ps"
+      i=$((i + 1))
+    done
+  done
+  ! fdtget "$kt/j773g-dt.dtb" /soc/ane@500000000 iommus >/dev/null 2>&1 ||
+    { echo "check: the dt overlay must not name the DARTs" >&2; return 1; }
+  [[ $(fdtget -t s "$kt/j773g-full.dtb" /soc/iommu@501800000 compatible) == apple,t8132-dart* ]]
+  echo "check: both overlays apply to t8132-j773g.dtb at $_kcommit"
+
+  # The module builds with DKMS against the installed linux-aurora-headers.
+  local build=(/usr/lib/modules/*/build)
+  local kver=${build[0]%/build}
+  kver=${kver##*/}
+  rm -rf "$srcdir/check"
+  mkdir -p "$srcdir/check/dkms" "$srcdir/check/src"
+  local dkms_options=(--dkmstree "$srcdir/check/dkms" --sourcetree "$srcdir/check/src" -k "$kver")
+  fakeroot dkms "${dkms_options[@]}" add "$srcdir/dkms/$pkgname-$pkgver"
+  fakeroot dkms "${dkms_options[@]}" build "$pkgname/$pkgver"
+  local ko
+  ko=$(ls "$srcdir/check/dkms/$pkgname/$pkgver/$kver"/*/module/ane_h16.ko*)
+  [[ -z $(modinfo -F alias "$ko") ]] || { echo "check: ane_h16 has a module alias; it must never autoload" >&2; return 1; }
+  modinfo -F parm "$ko" | grep -q '^stage:dt/0 (default)'
+  echo "check: built $ko for $kver (vermagic $(modinfo -F vermagic "$ko"))"
+}
+
+# _check_phandle DTB NODE PROPERTY INDEX TARGET: cell INDEX of PROPERTY in
+# NODE is TARGET's phandle (power-domains and interrupt-parent take one cell
+# per entry here).
+_check_phandle() {
+  local cells want
+  read -ra cells < <(fdtget -t u "$1" "$2" "$3")
+  want=$(fdtget -t u "$1" "$5" phandle)
+  [[ ${cells[$4]} == "$want" ]] ||
+    { echo "check: $2 $3[$4] is ${cells[$4]}, not $5 ($want)" >&2; return 1; }
+}
+
+package() {
+  install -d "$pkgdir/usr/src"
+  cp -r --no-preserve=ownership "dkms/$pkgname-$pkgver" "$pkgdir/usr/src/"
+
+  local o
+  for o in dt full; do
+    install -Dm644 "omarchy-ane-h16-$o.dtbo" \
+      "$pkgdir/usr/lib/omarchy-mac-boot/dtb-overlays/t8132-j773g/omarchy-ane-h16-$o.dtbo"
+    install -Dm644 "t8132-j773g-ane-h16-$o.dts" \
+      "$pkgdir/usr/share/$pkgname/t8132-j773g-ane-h16-$o.dts"
+  done
+
+  install -Dm755 ane-h16-experimental "$pkgdir/usr/bin/ane-h16-experimental"
+  install -Dm755 "$_srcname-$pkgver/packaging/omarchy-ane-firmware-fetch" \
+    "$pkgdir/usr/lib/$pkgname/omarchy-ane-firmware-fetch"
+  install -Dm644 ane-h16-experimental.modprobe.conf "$pkgdir/usr/lib/modprobe.d/$pkgname.conf"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 h16/README-bringup.md "$pkgdir/usr/share/doc/$pkgname/README-bringup.upstream.md"
+  install -Dm644 "$_srcname-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
