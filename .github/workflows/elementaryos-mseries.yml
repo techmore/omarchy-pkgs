@@ -30,9 +30,11 @@ on:
 permissions:
   contents: read
 
+# No cancellation: a push builds only the package directories it changed
+# (below), so a fix to one package must not kill another's multi-hour build.
 concurrency:
-  group: elementaryos-mseries-${{ github.ref }}
-  cancel-in-progress: true
+  group: elementaryos-mseries-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   plan:
@@ -42,11 +44,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - id: list
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           names="${{ github.event.inputs.packages || 'linux-aurora m1n1-aurora mesa-aurora' }}"
+          # A push builds the package directories it touched; a change to this
+          # workflow, a new branch or a dispatch builds them all.
+          if [[ ${{ github.event_name }} == push && -n $BEFORE && ! $BEFORE =~ ^0+$ ]] \
+            && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+            && ! git diff --quiet "$BEFORE" HEAD -- pkgbuilds/ \
+            && git diff --quiet "$BEFORE" HEAD -- .github/workflows/elementaryos-mseries.yml; then
+            names=$(git diff --name-only "$BEFORE" HEAD -- $(printf 'pkgbuilds/%s ' $names) \
+              | awk -F/ '{print $2}' | sort -u)
+          fi
           # aarch64 only, and GitHub's arm64 runner for every package: the
           # Namespace runner package_runner names for kernels is omacom's.
           matrix=$(printf '%s\n' $names | bin/build-matrix --arch aarch64 \
