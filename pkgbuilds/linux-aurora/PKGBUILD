@@ -10,14 +10,16 @@
 
 _auroraver=7.3.0
 _aurorarel=90
-pkgrel=1
+pkgrel=2
 
 # Fork pin: techmore/linux-m1pro-touchid branch elementaryos-mseries (Aurora
 # aurora-wip plus the Mac mini M4 (J773g, T8132) GPU/PMP/storage/PCIe/USB-C device
-# tree and the T8122 DPTX PHY). Same pkgbase, so the image builder, UKI name and
+# tree, the T8122 DPTX PHY and the merged mini/* topics: HDMI (dcpext0), speakers,
+# USB4 (routers off), SMC power button and reboot, BCM4388 Bluetooth calibration).
+# Same pkgbase, so the image builder, UKI name and
 # update-m1n1 are unchanged. _aurorarel stays above the channel's so pacman never
 # moves back to omacom's build. Not cold-boot qualified on M1/M2.
-_commit=fa26b0f92ef60a9d2ee5fae2d49a7dd12ee2473e
+_commit=fb0b8e6beed926fe8342d6b2242d593601d2afda
 
 # Any m1n1 1.6.1 loads these device trees. The Neo's own Stage 2 comes from the
 # image, so the floor stays where M1 and M2 users' m1n1-aurora already meets it.
@@ -42,7 +44,7 @@ source=(validate-config.py configure.sh "linux-${_commit}.tar.gz::$url/archive/$
         rust-toolchain.toml bindgen-kernel.py config)
 sha256sums=('aca7420a18139474da62a81c77fc6e5c3f25001f872b6e11e18605cd892aa4c3'
             'b95c0f0ddf106f3861e0e62a746af6a881fb8e0f356a892961f9e86062877400'
-            'e0308ca1560b9c623d20fe598a89a195c9095e0926e7e87a0fe06b8c40741e82'
+            '82854815b1c74e3e3583724714a6c26c1514e8ff6346a89656550716bde5becf'
             '443a9c4613172ea352f49b114818a1d75ab048ec4bd2d75b388a7ab3a8a1f046'
             '84a03d5fea19cae243c89f50c1736c639622d25d4d1de8d7d53ebd8f603c0f62'
             '98f76a885d81711013aad47e2ee13f000923191e43321738ec8f381690bf5160')
