@@ -1,0 +1,25 @@
+{
+  "about": "Source commits behind the Mac mini M4 package pins on techmore/omarchy-pkgs elementaryos-mseries. m4_mini_bench.py quotes a commit only when the installed version equals this version; update both together.",
+  "packages": {
+    "linux-aurora": {
+      "version": "7.3.0.aurora90-1",
+      "commit": "fa26b0f92ef60a9d2ee5fae2d49a7dd12ee2473e",
+      "source": "https://github.com/techmore/linux-m1pro-touchid (elementaryos-mseries)"
+    },
+    "m1n1-aurora": {
+      "version": "1.6.1.aurora90-1",
+      "commit": "9347c18180823812a75868b36698985ef3441a63",
+      "source": "https://github.com/techmore/m1n1 (elementaryos-mseries)"
+    },
+    "vulkan-aurora": {
+      "version": "1:26.3.0_devel.20261031.231461.8990cdb219b-1",
+      "commit": "8990cdb219b296b713b41350bcb1f6522ce062fb",
+      "source": "https://github.com/aurora-silicon/mesa (aurora-wip)"
+    },
+    "omarchy-mlx": {
+      "version": "0.7.28-5",
+      "commit": "5c15fbaead0e9e59006acf43538b32c23cd4ab2b",
+      "source": "https://github.com/joshuaswarren/omarchy-mlx (tag v0.7.28)"
+    }
+  }
+}

@@ -1,0 +1,81 @@
+# MLX on the Mac mini M4 (J773g, T8132, G16G GPU).
+#
+# omarchy-mlx-vulkan builds its private Honeykrisp ICD from joshuaswarren/mesa-1,
+# which has no G16G support: on the M4 mini agx_open_device refuses the GPU and
+# MLX finds no Vulkan device. Aurora's Honeykrisp (vulkan-aurora, aurora-silicon/
+# mesa aurora-wip) admits G16G since 662048cacc83 ("asahi: enable native G16G on
+# the shared AGX3 path"). omarchy-mlx-vulkan-aurora takes omarchy-mlx-vulkan's
+# place and points omarchy-mlx's private ICD path at the system vulkan-aurora
+# driver, so MLX and the desktop run one Honeykrisp build.
+#
+# omarchy-mlx-m4-bench installs the fixed release-gate benchmark from
+# techmore/omarchy-mlx m4-mini-bench and the stack manifest it reads to record
+# the kernel, m1n1 and Mesa commits behind the installed packages.
+pkgbase=omarchy-mlx-m4
+pkgname=(omarchy-mlx-vulkan-aurora omarchy-mlx-m4-bench)
+pkgver=0.1.0
+pkgrel=1
+arch=('aarch64')
+url='https://github.com/techmore/omarchy-mlx/tree/m4-mini-bench'
+license=('MIT')
+# omarchy-mlx depends on omarchy-mlx-vulkan=<its pkgver-pkgrel>, so the
+# replacement provides that exact version. Bump it with omarchy-mlx.
+_omarchy_mlx_ver=0.7.28-5
+# techmore/omarchy-mlx m4-mini-bench: scripts/m4_mini_bench.py and its doc.
+_bench_commit=0f845c998707e3740cd4ce447aef10ed0356f538
+_raw=https://raw.githubusercontent.com/techmore/omarchy-mlx/$_bench_commit
+checkdepends=('python')
+source=("m4_mini_bench-${_bench_commit:0:12}.py::$_raw/scripts/m4_mini_bench.py"
+        "m4-mini-bench-${_bench_commit:0:12}.md::$_raw/docs/m4-mini-bench.md"
+        stack.json
+        omarchy-mlx-m4-bench)
+sha256sums=('2dc1e7a6d71d8c5f43414ad21c2206f9e88ae34426685323ab410fca4554ebb9'
+            'e4988dafe0dca047b79703251e46afd6276376d11281a82a5e4b2af646cfcc38'
+            'f87f9753ba15c9a30c40f9bfbd8ae2fa805b93247425c247c360746628fc31dc'
+            '974a86fa75d28425f5ccad9c2a037583e1db89adb1325567c815442559b633c8')
+
+check() {
+  python -I "$srcdir/m4_mini_bench-${_bench_commit:0:12}.py" --self-test
+  # The manifest is what the benchmark quotes as commits: every entry needs
+  # a version in pacman -Q form and a full 40-character commit.
+  python -I - "$srcdir/stack.json" <<'PY'
+import json, re, sys
+packages = json.load(open(sys.argv[1]))["packages"]
+for name in ("linux-aurora", "m1n1-aurora", "vulkan-aurora", "omarchy-mlx"):
+    entry = packages[name]
+    assert re.fullmatch(r"[0-9a-f]{40}", entry["commit"]), name
+    assert re.fullmatch(r"([0-9]+:)?[^-\s]+-[0-9.]+", entry["version"]), name
+PY
+}
+
+package_omarchy-mlx-vulkan-aurora() {
+  pkgdesc='Aurora Honeykrisp (vulkan-aurora) as the Vulkan driver of omarchy-mlx, for the Mac mini M4'
+  # 1:26.3.0_devel.20261031 is the first packaged aurora-wip pin with G16G.
+  depends=('vulkan-aurora>=1:26.3.0_devel.20261031')
+  provides=("omarchy-mlx-vulkan=$_omarchy_mlx_ver")
+  conflicts=('omarchy-mlx-vulkan' 'mesa-honeykrisp-omarchy')
+
+  # The path omarchy-mlx selects before any system ICD. It names the system
+  # manifest, whose library_path is /usr/lib/libvulkan_asahi.so. No
+  # mesa-git-sha file: the tarball-built driver reports no git SHA in
+  # driverInfo, so omarchy-mlx records the identity without enforcing one.
+  install -d "$pkgdir/usr/lib/omarchy-mlx/vulkan"
+  ln -s /usr/share/vulkan/icd.d/asahi_icd.aarch64.json \
+    "$pkgdir/usr/lib/omarchy-mlx/vulkan/honeykrisp_icd.aarch64.json"
+}
+
+package_omarchy-mlx-m4-bench() {
+  pkgdesc='Fixed MLX language-model benchmark for the Mac mini M4 release gate'
+  depends=('omarchy-mlx' 'python')
+  optdepends=('vulkan-tools: record the vulkaninfo renderer summary'
+              'mesa-utils: record the eglinfo/glxinfo renderer string')
+
+  local dir=/usr/lib/omarchy-mlx-m4
+  install -Dm644 "$srcdir/m4_mini_bench-${_bench_commit:0:12}.py" "$pkgdir$dir/m4_mini_bench.py"
+  printf 'techmore/omarchy-mlx@%s scripts/m4_mini_bench.py\n' "$_bench_commit" \
+    | install -Dm644 /dev/stdin "$pkgdir$dir/m4_mini_bench.source"
+  install -Dm755 "$srcdir/omarchy-mlx-m4-bench" "$pkgdir/usr/bin/omarchy-mlx-m4-bench"
+  install -Dm644 "$srcdir/stack.json" "$pkgdir/usr/share/omarchy-mlx-m4/stack.json"
+  install -Dm644 "$srcdir/m4-mini-bench-${_bench_commit:0:12}.md" \
+    "$pkgdir/usr/share/doc/$pkgname/m4-mini-bench.md"
+}

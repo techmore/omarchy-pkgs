@@ -1,0 +1,113 @@
+name: Build elementaryos-mseries-mlx packages
+
+# Fork-only: build the Mac mini M4 (J773g, T8132) MLX packages on every push
+# to elementaryos-mseries-mlx (elementaryos-mseries plus pkgbuilds/omarchy-mlx-m4),
+# the same way build-pr.yml builds a PR's
+# aarch64 packages (bin/build in the omarchy-pkg-builder container against
+# the edge mirror, natively on GitHub's arm64 runners), and upload the
+# makepkg output as artifacts.
+#
+# Signing: like build-pr.yml, nothing here signs. publish.yml signs on merge
+# to master with the omacom repository key, which this fork does not have and
+# must not hold. These artifacts are unsigned candidates; an image builder
+# that installs them must trust them explicitly (local repo with its own key,
+# or SigLevel for that repo only), never by turning signature checks off
+# globally.
+on:
+  push:
+    branches: [elementaryos-mseries-mlx]
+    paths:
+      - pkgbuilds/omarchy-mlx-m4/**
+      - .github/workflows/elementaryos-mseries-mlx.yml
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: "Space-separated package directories to build"
+        default: "omarchy-mlx-m4"
+        required: true
+
+permissions:
+  contents: read
+
+# No cancellation: a push builds only the package directories it changed
+# (below), so a fix to one package must not kill another's multi-hour build.
+concurrency:
+  group: elementaryos-mseries-mlx-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: list
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          names="${{ github.event.inputs.packages || 'omarchy-mlx-m4' }}"
+          # A push builds the package directories it touched; a change to this
+          # workflow, a new branch or a dispatch builds them all.
+          if [[ ${{ github.event_name }} == push && -n $BEFORE && ! $BEFORE =~ ^0+$ ]] \
+            && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+            && ! git diff --quiet "$BEFORE" HEAD -- pkgbuilds/ \
+            && git diff --quiet "$BEFORE" HEAD -- .github/workflows/elementaryos-mseries-mlx.yml; then
+            names=$(git diff --name-only "$BEFORE" HEAD -- $(printf 'pkgbuilds/%s ' $names) \
+              | awk -F/ '{print $2}' | sort -u)
+          fi
+          # aarch64 only, and GitHub's arm64 runner for every package: the
+          # Namespace runner package_runner names for kernels is omacom's.
+          matrix=$(printf '%s\n' $names | bin/build-matrix --arch aarch64 \
+            | jq -c '.include |= map(.runner = "[\"ubuntu-24.04-arm\"]")')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          jq -r '.include[] | "\(.package) \(.arch) on \(.runner)"' <<<"$matrix"
+
+  build:
+    needs: plan
+    name: build (${{ matrix.package }}, ${{ matrix.arch }})
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build ${{ matrix.package }} (${{ matrix.arch }})
+        env:
+          CONTAINER_ENGINE: docker
+          # The runner has 4 vCPUs; the PKGBUILDs default to -j10.
+          OMARCHY_BUILD_JOBS: 4
+        run: bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.package }}-${{ matrix.arch }}
+          path: src/**/meson-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+      # packages.tar, as build-pr.yml packs it: the upload action rejects the
+      # ':' in an epoch'd filename (mesa-aurora). helpers/artifact-helpers.sh
+      # unpack_packages reads it back.
+      - name: Pack artifact
+        run: |
+          set -euo pipefail
+          source helpers/artifact-helpers.sh
+          mkdir -p upload
+          pack_packages build-output/edge/${{ matrix.arch }} upload/packages.tar
+          tar -tvf upload/packages.tar
+          (cd build-output/edge/${{ matrix.arch }} && sha256sum -- *.pkg.tar.zst) | tee upload/SHA256SUMS
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}-${{ matrix.arch }}-${{ github.sha }}
+          path: upload/
+          if-no-files-found: error
+          retention-days: 30
