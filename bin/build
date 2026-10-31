@@ -270,6 +270,20 @@ DOCKER_ARGS=(
   -v "$BUILD_ROOT/pkgbuilds:/pkgbuilds:ro"
 )
 
+# Persistent compiler cache (self-hosted runners): OMARCHY_CCACHE_DIR on the
+# host is shared into every build container. Packages that support it (see
+# linux-aurora's _make) compile through ccache; output is unchanged.
+if [[ -n ${OMARCHY_CCACHE_DIR:-} ]]; then
+  mkdir -p "$OMARCHY_CCACHE_DIR"
+  [[ "$CONTAINER_ENGINE" == "docker" ]] && make_dir_writable "$OMARCHY_CCACHE_DIR"
+  DOCKER_ARGS+=(
+    -v "$OMARCHY_CCACHE_DIR:/ccache"
+    -e CCACHE_DIR=/ccache
+    -e CCACHE_MAXSIZE="${OMARCHY_CCACHE_MAXSIZE:-8G}"
+    -e CCACHE_UMASK=000
+  )
+fi
+
 # Podman-created images can leave WORKDIR owned by a remapped uid. Mount the
 # existing host-user-owned workspace so the builder can write there.
 if [[ "$CONTAINER_ENGINE" == "podman" ]]; then

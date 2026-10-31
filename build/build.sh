@@ -399,6 +399,12 @@ build_package() {
     done
   fi
 
+  # A mounted compiler cache needs the ccache binary in this container.
+  if [[ -n ${CCACHE_DIR:-} ]] && ! command -v ccache >/dev/null; then
+    sudo pacman -S --needed --noconfirm ccache || return 1
+  fi
+  [[ -n ${CCACHE_DIR:-} ]] && ccache -z >/dev/null 2>&1 || true
+
   # Build package without signing (signing is done separately)
   # PACMAN override uses a wrapper that adds --ask 4 to auto-resolve conflicts
   # (e.g. rustup replacing rust) since --noconfirm defaults to 'N' on those prompts
@@ -415,6 +421,7 @@ build_package() {
   fi
 
   if PACMAN=/usr/local/bin/pacman-for-makepkg makepkg "${makepkg_flags[@]}"; then
+    [[ -n ${CCACHE_DIR:-} ]] && ccache -s 2>/dev/null | sed 's/^/    ccache: /' || true
     # Ensure output directory exists
     mkdir -p "$BUILD_OUTPUT_DIR"
 

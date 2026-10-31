@@ -88,7 +88,12 @@ jobs:
           # GitHub's runner has 4 vCPUs (the PKGBUILDs default to -j10); PKG_BUILD_JOBS
           # overrides it for a larger self-hosted runner.
           OMARCHY_BUILD_JOBS: ${{ vars.PKG_BUILD_JOBS || 4 }}
-        run: bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
+        run: |
+          # Self-hosted runners keep a compiler cache between builds.
+          if [[ $RUNNER_ENVIRONMENT == self-hosted ]]; then
+            export OMARCHY_CCACHE_DIR="$HOME/pkg-ccache"
+          fi
+          bin/build --mirror edge --arch "${{ matrix.arch }}" --package "${{ matrix.package }}"
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v4

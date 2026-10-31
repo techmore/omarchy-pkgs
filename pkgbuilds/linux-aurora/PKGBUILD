@@ -26,7 +26,11 @@ _commit=48be8a81085455d802cd4d34a2b18c620833a568
 _m1n1_version=1.6.1
 
 pkgbase=linux-aurora
-_srcname=linux-m1pro-touchid-${_commit}
+# GitHub's archive unpacks to linux-m1pro-touchid-<commit>. prepare() renames
+# it to a fixed name, so the source path (and with it every compiler command
+# line) is the same for every commit and a compiler cache can reuse objects.
+_archive_dir=linux-m1pro-touchid-${_commit}
+_srcname=linux-src
 _kernelname=${pkgbase#linux}
 _desc="AArch64 Apple Silicon (Aurora kernel)"
 pkgver="${_auroraver}.aurora${_aurorarel}"
@@ -58,11 +62,17 @@ export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EP
 # Kbuild assigns BINDGEN itself, so an environment-only value is ignored.
 # Supply the wrapper and its real tool in every makepkg phase, not just prepare.
 _make() {
+  # With a compiler cache mounted (CCACHE_DIR), compile through ccache. The
+  # objects are the same; only unchanged files are not recompiled.
+  local -a cc=()
+  if [[ -n ${CCACHE_DIR:-} ]] && command -v ccache >/dev/null; then
+    cc=(CC="ccache ${AURORA_LLVM:-/usr/lib/llvm18/bin/}clang")
+  fi
   AURORA_BINDGEN_REAL="$srcdir/private-bindgen/rust-bindgen-0.73.2/target/release/bindgen" \
     RUSTFMT="$(rustup which --toolchain 1.99.0 rustfmt)" \
     LIBCLANG_PATH="${AURORA_LIBCLANG_PATH:-/usr/lib/llvm18/lib}" \
     RUSTUP_TOOLCHAIN=1.85.0 make LLVM="${AURORA_LLVM:-/usr/lib/llvm18/bin/}" \
-    BINDGEN="$srcdir/bindgen-kernel.py" LOCALVERSION= "$@"
+    BINDGEN="$srcdir/bindgen-kernel.py" LOCALVERSION= "${cc[@]}" "$@"
 }
 
 _check_kernelrelease() {
@@ -73,6 +83,8 @@ _check_kernelrelease() {
 }
 
 prepare() {
+  rm -rf "$_srcname"
+  mv "$_archive_dir" "$_srcname"
   cd $_srcname
 
   echo "Setting version..."
