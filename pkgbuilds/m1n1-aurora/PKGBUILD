@@ -1,9 +1,10 @@
 # techmore/m1n1 elementaryos-mseries: Aurora m1n1 plus the Mac mini M4 GPU, PMP and
-# ANS storage handoff and inline NVMe. Ordinary updates refresh ESP Stage 2, never
+# ANS storage handoff, inline NVMe, the J773g HDMI (dcpext0) handoff and the
+# display coprocessors' __OS_LOG reservations. Ordinary updates refresh ESP Stage 2, never
 # enroll Stage 1.
 pkgname=m1n1-aurora
 pkgver=1.6.1.aurora90
-pkgrel=1
+pkgrel=2
 pkgdesc='Omarchy Apple Silicon bootloader from techmore/m1n1'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
@@ -15,13 +16,13 @@ conflicts=('m1n1' 'aura' 'm1n1-neo')
 replaces=('aura' 'm1n1-neo')
 makedepends=('clang' 'lld' 'llvm' 'rustup' 'make' 'python')
 options=('!strip' '!debug')
-_commit=9347c18180823812a75868b36698985ef3441a63
+_commit=aac818930d32031d238990a221644de76b7a50d4
 _srcname=m1n1-$_commit
 source=("$_srcname.tar.gz::$url/archive/$_commit.tar.gz"
         build-qualification.json validate-qualification.py
         bootlogo_48.bin bootlogo_128.bin bootlogo_256.bin)
-sha256sums=('dc672de54955d81029f0bb4cf6726321d38ea89a4062f4188649c1e22c2b27ae'
-            'e4e179bf0a2bdbe997908d45a291e4c6579d9ca16b33d6b6602bc2ae24c9ed22'
+sha256sums=('ab3073c19a34bc41c33cd9fffab7b26a087b7e7c1077671f3b99cf6e66a2498e'
+            '22fd9c48f2da6395a7884bea397817c105762d3bf5abbe38a809de554fdaf3f1'
             '43578b83ebea180319b64c9b63377dab6148e997e6f75fd4abcb325484f7ca95'
             '6668050653645711ad7523fe2abeb4cbe85a92c875f3eec754b6db23cea2191c'
             'b19cb017645c7a9068ea0be9b6bb394131d7ca11b28093cf6caa1ffca74b0a4e'
