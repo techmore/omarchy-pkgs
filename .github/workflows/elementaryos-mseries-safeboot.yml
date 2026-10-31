@@ -1,0 +1,79 @@
+name: Build elementaryos-mseries-safeboot packages
+
+# Fork-only: test and build omarchy-trial-boot, the safe first-boot kit for
+# the Mac mini M4 (J773g), on every push to elementaryos-mseries-safeboot
+# (elementaryos-mseries plus pkgbuilds/omarchy-trial-boot). The tests run the
+# tool against fixture machines, as a user and as root, with the real
+# grub-editenv; the build is bin/build in the omarchy-pkg-builder container
+# against the edge mirror on GitHub's arm64 runner, as
+# elementaryos-mseries.yml builds the platform packages, and its check()
+# runs the same tests again.
+#
+# Signing: nothing here signs. These artifacts are unsigned candidates; an
+# image builder that installs them must trust them explicitly (local repo with
+# its own key, or SigLevel for that repo only), never by turning signature
+# checks off globally.
+on:
+  push:
+    branches: [elementaryos-mseries-safeboot]
+    paths:
+      - pkgbuilds/omarchy-trial-boot/**
+      - .github/workflows/elementaryos-mseries-safeboot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elementaryos-mseries-safeboot-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install grub-editenv and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq grub-common shellcheck
+      - name: Lint
+        run: |
+          shellcheck -S error pkgbuilds/omarchy-trial-boot/omarchy-trial-boot pkgbuilds/omarchy-trial-boot/test.sh
+          bash -n pkgbuilds/omarchy-trial-boot/PKGBUILD
+      - name: Test as a user
+        run: bash pkgbuilds/omarchy-trial-boot/test.sh
+      - name: Test as root
+        run: sudo bash pkgbuilds/omarchy-trial-boot/test.sh
+      - name: Package metadata
+        run: ./tests/package-metadata.sh
+
+  build:
+    needs: test
+    name: build (omarchy-trial-boot, aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build omarchy-trial-boot (aarch64)
+        env:
+          CONTAINER_ENGINE: docker
+          OMARCHY_BUILD_JOBS: 4
+        run: bin/build --mirror edge --arch aarch64 --package omarchy-trial-boot
+      - name: Pack artifact
+        run: |
+          set -euo pipefail
+          source helpers/artifact-helpers.sh
+          mkdir -p upload
+          pack_packages build-output/edge/aarch64 upload/packages.tar
+          tar -tvf upload/packages.tar
+          (cd build-output/edge/aarch64 && sha256sum -- *.pkg.tar.zst) | tee upload/SHA256SUMS
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: omarchy-trial-boot-aarch64-${{ github.sha }}
+          path: upload/
+          if-no-files-found: error
+          retention-days: 30

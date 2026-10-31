@@ -1,0 +1,51 @@
+# Boot a trial kernel or install exactly once on an Apple Silicon Mac and fall
+# back to the known-good entry on any failure: a one-shot the boot loader
+# clears before it starts the trial (Limine's LoaderEntryOneShot persisted
+# through U-Boot's ESP variable file, or a GRUB env file on the ESP), panic=10,
+# watchdog.open_timeout with apple_wdt, an early deadline unit that holds the
+# watchdog, and collection of the trial's journal and pstore on the next boot.
+# The method is chriskearney/maclab's (MIT); see README.md.
+pkgname=omarchy-trial-boot
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Boot a trial kernel once on an Apple Silicon Mac, falling back to the known-good entry on any failure'
+arch=('aarch64')
+url='https://github.com/techmore/omarchy-pkgs/tree/elementaryos-mseries-safeboot/pkgbuilds/omarchy-trial-boot'
+license=('MIT')
+depends=('bash' 'coreutils' 'gawk' 'grep' 'sed' 'systemd' 'util-linux')
+optdepends=('limine: Limine trials (Omarchy on Apple Silicon)'
+            'grub: GRUB trials (grub-editenv)'
+            'e2fsprogs: chattr, to replace an existing EFI variable')
+source=(omarchy-trial-boot
+        omarchy-trial-boot-watch.service
+        omarchy-trial-boot-complete.service
+        omarchy-trial-boot-collect.service
+        README.md
+        test.sh)
+sha256sums=('d2a46c3f1853a3d36b44ed33a38262ef33c38efff20fb8781aeded956d8ad06f'
+            '76da7701dbf0182c13a322ec60953ae86fd5b141f89d9b572a12e38048f45e96'
+            '8c94571956bda9d297ad55a8e1d3af8e07d9f18501e6e484e269f5b9c4449326'
+            'ff0105675a395e0435021b1d8cd0b15d39a02175bdf88332d176adc383b6c584'
+            '8c5418ae4c5e9c668c789967e5635d631ac14027ea4f4622d24b1c9951f72700'
+            '6364f397b43a705c5cb5f2e8e97ff4d6d3e27a7018c901cde30a313eafd403a4')
+
+check() {
+  OMARCHY_TRIAL_BOOT_BIN="$srcdir/omarchy-trial-boot" bash "$srcdir/test.sh"
+}
+
+package() {
+  install -Dm755 omarchy-trial-boot "$pkgdir/usr/bin/omarchy-trial-boot"
+  local unit
+  for unit in watch complete collect; do
+    install -Dm644 "omarchy-trial-boot-$unit.service" "$pkgdir/usr/lib/systemd/system/omarchy-trial-boot-$unit.service"
+  done
+  # Enabled statically: each unit is a no-op unless its condition holds (a
+  # trial boot, or a pending trial on a default boot), and a fresh image's
+  # root gets them without running systemctl.
+  install -d "$pkgdir/usr/lib/systemd/system/sysinit.target.wants" "$pkgdir/usr/lib/systemd/system/multi-user.target.wants"
+  ln -s ../omarchy-trial-boot-watch.service "$pkgdir/usr/lib/systemd/system/sysinit.target.wants/omarchy-trial-boot-watch.service"
+  ln -s ../omarchy-trial-boot-complete.service "$pkgdir/usr/lib/systemd/system/multi-user.target.wants/omarchy-trial-boot-complete.service"
+  ln -s ../omarchy-trial-boot-collect.service "$pkgdir/usr/lib/systemd/system/multi-user.target.wants/omarchy-trial-boot-collect.service"
+  install -dm755 "$pkgdir/etc/omarchy-trial-boot/checks.d"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/omarchy-trial-boot/README.md"
+}

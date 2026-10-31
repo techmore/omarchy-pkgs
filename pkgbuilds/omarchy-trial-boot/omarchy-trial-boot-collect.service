@@ -1,0 +1,16 @@
+# On the boot after a trial (any boot that is not one), save the trial's
+# journal, kernel log and pstore records under /var/lib/omarchy-trial-boot and
+# write its verdict. `omarchy-trial-boot collect` prints it again.
+[Unit]
+Description=Collect the logs of the last trial boot (omarchy-trial-boot)
+Documentation=file:///usr/share/doc/omarchy-trial-boot/README.md
+ConditionKernelCommandLine=!omarchy.trial
+ConditionPathExists=/var/lib/omarchy-trial-boot/pending
+After=local-fs.target systemd-journald.service systemd-journal-flush.service systemd-pstore.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/omarchy-trial-boot collect --quiet
+
+[Install]
+WantedBy=multi-user.target

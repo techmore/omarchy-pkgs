@@ -1,0 +1,27 @@
+# A trial boot (omarchy.trial= on the kernel command line, set by
+# omarchy-trial-boot arm) is rebooted unless it reaches boot-complete by its
+# deadline. Needs only the local disk, so a trial without network, display or
+# a working desktop still comes back. The one-shot is spent by then, so the
+# reboot lands on the default entry. With systemd.watchdog_sec=0 on the trial's
+# command line it also holds /dev/watchdog0, feeding it while PID 1 answers.
+[Unit]
+Description=Reboot a trial boot that misses its deadline (omarchy-trial-boot)
+Documentation=file:///usr/share/doc/omarchy-trial-boot/README.md
+DefaultDependencies=no
+ConditionKernelCommandLine=omarchy.trial
+After=local-fs.target
+Conflicts=shutdown.target
+Before=shutdown.target
+# Keep watching from the emergency or rescue shell: a trial stuck there is a
+# failure too. `omarchy-trial-boot hold` stops it for debugging.
+IgnoreOnIsolate=yes
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omarchy-trial-boot watch
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=sysinit.target

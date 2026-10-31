@@ -1,0 +1,19 @@
+# Marks a trial boot complete once it reaches its default target and
+# boot-complete.target (which units such as systemd-boot-check-no-failures.service
+# can gate with RequiredBy=boot-complete.target), and every executable in
+# /etc/omarchy-trial-boot/checks.d passes. Until then the watch unit's deadline
+# stands.
+[Unit]
+Description=Mark a trial boot complete (omarchy-trial-boot)
+Documentation=file:///usr/share/doc/omarchy-trial-boot/README.md
+ConditionKernelCommandLine=omarchy.trial
+Wants=boot-complete.target
+After=multi-user.target graphical.target boot-complete.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/omarchy-trial-boot complete
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

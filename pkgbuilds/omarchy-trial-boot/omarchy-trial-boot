@@ -1,0 +1,1349 @@
+#!/bin/bash
+
+# omarchy-trial-boot: boot a trial kernel or install exactly once, and come back
+# to the known-good boot entry by itself on any failure.
+#
+# The method is chriskearney/maclab's (MIT), rewritten for an attended Mac:
+#
+# - A one-shot that the boot loader clears before it starts the trial entry.
+#   Limine: the Boot Loader Interface variable LoaderEntryOneShot, which Limine
+#   deletes as it reads it. Apple Silicon's U-Boot keeps EFI variables in RAM
+#   at runtime, so the store it exports (VarToFile) is written to the ESP file
+#   it loads them from (RTStorageVolatile, ubootefi.var). GRUB: a variable in
+#   an env file on the FAT ESP, read and cleared by a custom.cfg hook, because
+#   GRUB cannot write grubenv on btrfs. Any reset after that, for any reason,
+#   lands on the default entry.
+# - panic=10, so a panic reboots.
+# - watchdog.open_timeout=N: U-Boot leaves apple_wdt running into Linux, and the
+#   kernel stops feeding it N seconds after the driver probes unless userspace
+#   has opened /dev/watchdog0. A boot stuck before that is reset.
+# - An early systemd unit (watch) that holds the watchdog and reboots a trial
+#   that does not reach boot-complete by its deadline.
+# - Collection of the trial's journal and any pstore records on the next boot.
+#
+# Bash 3.2 compatible where it has to run on macOS (stage --esp, help).
+
+set -uo pipefail
+
+VERSION=0.1.0
+ENTRY=omarchy-trial
+BLI_GUID=4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+UBOOT_GUID=b2ac5fc9-92b7-4acd-aeac-11e818c3130c
+BEGIN_MARK='# omarchy-trial-boot: begin. Managed by omarchy-trial-boot: a trial entry, booted once.'
+BEGIN_PREFIX='# omarchy-trial-boot: begin'
+END_MARK='# omarchy-trial-boot: end'
+GRUB_VAR=omarchy_trial_next
+GRUB_ENV=omarchy-trial.env
+GRUB_CFG=omarchy-trial.cfg
+DEFAULT_DEADLINE=900
+DEFAULT_OPEN_TIMEOUT=180
+
+# Every path the tool touches can be redirected, for the tests.
+state_dir=${OMARCHY_TRIAL_STATE:-/var/lib/omarchy-trial-boot}
+run_dir=${OMARCHY_TRIAL_RUN:-/run/omarchy-trial-boot}
+efivars=${OMARCHY_TRIAL_EFIVARS:-/sys/firmware/efi/efivars}
+proc_cmdline=${OMARCHY_TRIAL_CMDLINE:-/proc/cmdline}
+uptime_file=${OMARCHY_TRIAL_UPTIME:-/proc/uptime}
+boot_id_file=${OMARCHY_TRIAL_BOOT_ID:-/proc/sys/kernel/random/boot_id}
+watchdog_dev=${OMARCHY_TRIAL_WATCHDOG:-/dev/watchdog0}
+grub_dir=${OMARCHY_TRIAL_GRUB_DIR:-/boot/grub}
+boot_dir=${OMARCHY_TRIAL_BOOT_DIR:-/boot}
+checks_dir=${OMARCHY_TRIAL_CHECKS:-/etc/omarchy-trial-boot/checks.d}
+modules_dir=${OMARCHY_TRIAL_MODULES:-/usr/lib/modules}
+limine_default=${OMARCHY_TRIAL_LIMINE_DEFAULT:-/etc/default/limine}
+unit_dir=${OMARCHY_TRIAL_UNIT_DIR:-/usr/lib/systemd/system}
+pstore_dirs=${OMARCHY_TRIAL_PSTORE:-/sys/fs/pstore /var/lib/systemd/pstore}
+tick=${OMARCHY_TRIAL_TICK:-5}
+escalate_after=${OMARCHY_TRIAL_ESCALATE:-120}
+pid1_check=${OMARCHY_TRIAL_PID1_CHECK:-1}
+reboot_cmd=${OMARCHY_TRIAL_REBOOT:-}
+
+me=omarchy-trial-boot
+
+say() { printf '%s\n' "$*"; }
+warn() { printf '%s: warning: %s\n' "$me" "$*" >&2; }
+die() {
+  printf '%s: %s\n' "$me" "$*" >&2
+  exit 1
+}
+log() {
+  # The watch and complete units log to the journal through stderr.
+  printf '%s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-trial-boot COMMAND [OPTIONS]
+
+Boot a trial kernel or install once. The boot loader clears the one-shot before
+it starts the trial, so a panic, hang, watchdog reset or missed deadline comes
+back on the default (known-good) entry.
+
+Commands
+  arm [OPTIONS] ENTRY    Write the trial entry and arm it for the next boot only
+  stage [OPTIONS] ENTRY  Write the trial entry without arming it (pick it by hand
+                         in the boot menu; works on macOS with --esp)
+  disarm                 Clear the one-shot and remove the trial entry
+  status                 Show the loader, the trial entry, the one-shot, this
+                         boot and past trial results
+  collect [--out DIR]    After a trial: save its journal, kernel log and pstore
+                         records, and print what happened
+  hold                   On a trial boot: stop the deadline and release the
+                         watchdog, to debug at the console
+  watch | complete       Run by the systemd units on a trial boot
+
+ENTRY is the kernel to try: a Limine entry name (linux-aurora), a UKI path on
+the ESP (EFI/Linux/omarchy_linux-aurora.efi) or, for GRUB, a kernel name with
+/boot/vmlinuz-NAME and its initramfs.
+
+Options for arm and stage
+  --deadline SEC        Reboot the trial unless it reaches boot-complete by this
+                        uptime (default 900)
+  --open-timeout SEC    watchdog.open_timeout: reset a boot that has not opened
+                        the watchdog by then (default 180; 0 leaves it off)
+  --watchdog OWNER      trial (default with this package on the trial's root):
+                        the watch unit holds the watchdog; systemd: systemd
+                        holds it (systemd.watchdog_sec=30); none
+  --verbose             Drop quiet and splash and boot with loglevel=7
+  --append "ARGS"       Add kernel arguments to the trial
+  --cmdline-base "ARGS" The command line to start from (default: the menu
+                        entry's, else the running one's)
+  --uki PATH            Limine: boot this EFI file on the ESP instead
+  --initrd PATH         GRUB: the initramfs for the kernel
+  --loader limine|grub  Default: detected from the ESP
+  --esp DIR             The mounted ESP (default /boot/efi, /efi or /boot)
+  --id ID               Trial id (default: a timestamp and the entry)
+  --force               Arm even if the kernel looks unable to take the watchdog
+  --reboot              arm only: reboot once armed
+EOF
+}
+
+# --- small helpers -------------------------------------------------------------
+
+is_uint() { [[ ${1:-} =~ ^[0-9]+$ ]]; }
+
+os_name() { printf '%s\n' "${OMARCHY_TRIAL_OS:-$(uname -s)}"; }
+
+uptime_s() {
+  local up rest
+  read -r up rest <"$uptime_file" 2>/dev/null || {
+    echo 0
+    return
+  }
+  echo "${up%%.*}"
+}
+
+boot_id() { cat "$boot_id_file" 2>/dev/null || echo unknown; }
+
+cmdline_words() { cat "$proc_cmdline" 2>/dev/null || true; }
+
+# words STRING: STRING split on blanks, one per line, never globbed.
+words() {
+  printf '%s\n' "$1" | tr -s ' \t' '\n\n' | grep -v '^$'
+}
+
+# cmdline_value KEY: the value of KEY=VALUE on the running command line.
+cmdline_value() {
+  local word
+  while IFS= read -r word; do
+    case $word in
+      "$1="*)
+        printf '%s\n' "${word#*=}"
+        return 0
+        ;;
+    esac
+  done < <(words "$(cmdline_words)")
+  return 1
+}
+
+cmdline_has() {
+  local word
+  while IFS= read -r word; do
+    [[ $word == "$1" ]] && return 0
+  done < <(words "$(cmdline_words)")
+  return 1
+}
+
+# kv_get FILE KEY: KEY=VALUE files are read, never sourced.
+kv_get() {
+  [[ -f $1 ]] || return 1
+  awk -v k="$2" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { if (v == "") exit 1; print v }' "$1"
+}
+
+sync_path() {
+  sync "$@" 2>/dev/null || sync
+}
+
+# write_synced DEST SRC: replace DEST atomically with SRC's bytes and flush,
+# for files the firmware or boot loader reads at the next boot.
+write_synced() {
+  local dest=$1 src=$2 tmp
+  tmp=$(mktemp "$(dirname "$dest")/.omarchy-trial.XXXXXX") || return 1
+  if ! cat "$src" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  sync_path "$tmp"
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  sync_path "$(dirname "$dest")"
+}
+
+sanitize_id() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64; }
+
+# --- the ESP and the loader ----------------------------------------------------
+
+esp=""
+loader=""
+
+find_esp() {
+  local dir
+  [[ -n $esp ]] && return 0
+  command -v findmnt >/dev/null 2>&1 || die "no --esp given and findmnt is unavailable"
+  for dir in /boot/efi /efi /boot; do
+    if [[ $(findmnt -n -o FSTYPE --mountpoint "$dir" 2>/dev/null) == vfat ]]; then
+      esp=$dir
+      return 0
+    fi
+  done
+  die "no FAT ESP mounted at /boot/efi, /efi or /boot (give --esp)"
+}
+
+limine_loader_file() { printf '%s\n' "$esp/EFI/BOOT/BOOTAA64.EFI"; }
+
+detect_loader() {
+  [[ -n $loader ]] && return 0
+  local efi
+  efi=$(limine_loader_file)
+  if [[ -f $efi ]] && LC_ALL=C grep -a -q 'limine\.conf' "$efi" 2>/dev/null; then
+    loader=limine
+  elif [[ -f $grub_dir/grub.cfg ]]; then
+    loader=grub
+  else
+    die "cannot tell the boot loader: $efi is not Limine and there is no $grub_dir/grub.cfg (give --loader)"
+  fi
+}
+
+# --- trial command line --------------------------------------------------------
+
+# trial_cmdline BASE: BASE without anything the trial sets, plus the trial's
+# own arguments. Globals: trial_id deadline open_timeout wd_owner verbose append
+trial_cmdline() {
+  local base=$1 out="" word
+  while IFS= read -r word; do
+    case $word in
+      BOOT_IMAGE=* | initrd=* | panic=* | watchdog.open_timeout=* | watchdog.handle_boot_enabled=* | \
+        systemd.watchdog_sec=* | omarchy.trial=* | omarchy.trial_deadline=*) continue ;;
+    esac
+    if ((verbose)); then
+      case $word in
+        quiet | splash | loglevel=* | rd.udev.log_level=* | systemd.show_status=*) continue ;;
+      esac
+    fi
+    out="$out $word"
+  done < <(words "$base")
+  ((verbose)) && out="$out loglevel=7 systemd.show_status=1"
+  out="$out panic=10"
+  if ((open_timeout > 0)) && [[ $wd_owner != none ]]; then
+    out="$out watchdog.open_timeout=$open_timeout"
+  fi
+  case $wd_owner in
+    trial) out="$out systemd.watchdog_sec=0" ;;
+    systemd) out="$out systemd.watchdog_sec=30" ;;
+  esac
+  out="$out omarchy.trial=$trial_id omarchy.trial_deadline=$deadline"
+  [[ -n $append ]] && out="$out $append"
+  printf '%s\n' "${out# }"
+}
+
+running_cmdline_base() {
+  local base=""
+  # The UKIs' line on an Omarchy Mac, else the running one.
+  if [[ -f $limine_default ]]; then
+    base=$(sed -n 's/^KERNEL_CMDLINE\[default\]=//p' "$limine_default" | tail -n 1 | sed -E 's/^"(.*)"$/\1/')
+  fi
+  [[ -n $base ]] || base=$(cmdline_words)
+  printf '%s\n' "$base"
+}
+
+# --- Limine --------------------------------------------------------------------
+
+limine_conf() {
+  local rel
+  for rel in EFI/BOOT/limine.conf boot/limine/limine.conf boot/limine.conf limine/limine.conf limine.conf; do
+    if [[ -f $esp/$rel ]]; then
+      printf '%s\n' "$esp/$rel"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# limine_entry CONF NAME: the option lines of the first entry called NAME
+# (any depth, outside our own block), one per line, as KEY<TAB>VALUE.
+limine_entry() {
+  awk -v name="$2" -v begin="$BEGIN_PREFIX" -v end="$END_MARK" '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    index($0, begin) == 1 { ours = 1; next }
+    $0 == end { ours = 0; next }
+    ours { next }
+    {
+      t = trim($0)
+      if (t ~ /^\//) {
+        if (found) exit
+        n = t; sub(/^\/+/, "", n); sub(/^\+/, "", n); n = trim(n)
+        if (n == name) found = 1
+        next
+      }
+      if (found && t ~ /^[A-Za-z_]+[ \t]*:/) {
+        k = t; sub(/[ \t]*:.*/, "", k)
+        v = t; sub(/^[^:]*:[ \t]*/, "", v)
+        print tolower(k) "\t" v
+      }
+    }
+    END { if (!found) exit 1 }
+  ' "$1"
+}
+
+# A config hash enrolled in Limine makes it refuse any changed limine.conf.
+limine_enrolled() {
+  local efi sum
+  for efi in "$(limine_loader_file)" "$esp/EFI/limine/limine_aa64.efi"; do
+    [[ -f $efi ]] || continue
+    sum=$(LC_ALL=C grep -a -o '++CONFIG_B2SUM_SIGNATURE++[0-9a-f]\{128\}' "$efi" 2>/dev/null | head -n 1)
+    sum=${sum#++CONFIG_B2SUM_SIGNATURE++}
+    if [[ -n $sum && $sum =~ [1-9a-f] ]]; then
+      printf '%s\n' "$efi"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# limine_block CONF: the managed block, or nothing.
+limine_block() {
+  awk -v begin="$BEGIN_PREFIX" -v end="$END_MARK" '
+    index($0, begin) == 1 { ours = 1 }
+    ours { print }
+    $0 == end { ours = 0 }
+  ' "$1"
+}
+
+# limine_write_block CONF BLOCKFILE: CONF without our block, plus BLOCKFILE
+# (empty: no block) at the end, where it moves no other entry's index.
+limine_write_block() {
+  local conf=$1 block=$2 tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/omarchy-trial-conf.XXXXXX") || return 1
+  awk -v begin="$BEGIN_PREFIX" -v end="$END_MARK" '
+    index($0, begin) == 1 { ours = 1; next }
+    ours { if ($0 == end) ours = 0; next }
+    { lines[++n] = $0 }
+    END {
+      while (n > 0 && lines[n] ~ /^[ \t\r]*$/) n--
+      for (i = 1; i <= n; i++) print lines[i]
+    }
+  ' "$conf" >"$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+  if [[ -s $block ]]; then
+    {
+      echo
+      cat "$block"
+    } >>"$tmp"
+  fi
+  if cmp -s "$tmp" "$conf"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  write_synced "$conf" "$tmp"
+  local status=$?
+  rm -f "$tmp"
+  return $status
+}
+
+lock_fds_open=0
+# Omarchy's Limine tools take one of these before they touch the ESP; take both.
+lock_boot_partition() {
+  ((lock_fds_open)) && return 0
+  command -v flock >/dev/null 2>&1 || return 0
+  [[ ${OMARCHY_TRIAL_NO_LOCK:-0} == 1 ]] && return 0
+  local lock
+  for lock in /run/lock/boot-partition.lock /tmp/limine-global.lock; do
+    [[ -L $lock ]] && die "$lock is a symlink; refusing to use it"
+  done
+  mkdir -p /run/lock 2>/dev/null
+  exec 8>>/run/lock/boot-partition.lock || die "cannot open /run/lock/boot-partition.lock"
+  flock -w 60 8 || die "/run/lock/boot-partition.lock has been held for over 60 s (limine-snapper-sync?)"
+  exec 9>>/tmp/limine-global.lock || die "cannot open /tmp/limine-global.lock"
+  flock -w 60 9 || die "/tmp/limine-global.lock has been held for over 60 s"
+  lock_fds_open=1
+}
+
+limine_stage() {
+  local name=$1 conf options path_line base block enrolled
+  conf=$(limine_conf) || die "Limine is the loader but there is no limine.conf on $esp"
+  if enrolled=$(limine_enrolled); then
+    die "$enrolled has limine.conf's checksum enrolled, so Limine would refuse the changed menu; run 'limine enroll-config --reset $enrolled' first"
+  fi
+  if grep -Eiq '^[[:space:]]*remember_last_entry:[[:space:]]*yes' "$conf"; then
+    die "$conf sets remember_last_entry: yes, so Limine would keep booting the trial; set it to no first"
+  fi
+
+  options=""
+  if [[ -n $uki ]]; then
+    options="protocol: efi"$'\n'"path: boot():/${uki#/}"
+    [[ -f $esp/${uki#/} ]] || die "$esp/${uki#/} does not exist"
+  elif [[ $name == */* || $name == *.efi ]]; then
+    [[ -f $esp/${name#/} ]] || die "$esp/${name#/} does not exist"
+    options="protocol: efi"$'\n'"path: boot():/${name#/}"
+  else
+    local entry
+    if entry=$(limine_entry "$conf" "$name"); then
+      options=$(printf '%s\n' "$entry" | awk -F'\t' '$1 != "cmdline" && $1 != "kernel_cmdline" && $1 != "comment" { print $1 ": " $2 }')
+      [[ -n $cmdline_base ]] || cmdline_base=$(printf '%s\n' "$entry" | awk -F'\t' '$1 == "cmdline" || $1 == "kernel_cmdline" { print $2; exit }')
+    elif [[ -f $esp/EFI/Linux/omarchy_$name.efi ]]; then
+      options="protocol: efi"$'\n'"path: boot():/EFI/Linux/omarchy_$name.efi"
+    else
+      die "$conf has no entry named $name, and there is no $esp/EFI/Linux/omarchy_$name.efi"
+    fi
+  fi
+  path_line=$(printf '%s\n' "$options" | grep -E '^(path|image_path|kernel_path):' | head -n 1)
+  [[ -n $path_line ]] || die "the $name entry has no path"
+  if [[ -z $cmdline_base ]]; then
+    [[ $(os_name) == Linux ]] || die "cannot tell the command line to start from; give --cmdline-base"
+    cmdline_base=$(running_cmdline_base)
+  fi
+  [[ $cmdline_base == *root=* ]] || warn "the base command line has no root=: '$cmdline_base'"
+
+  block=$(mktemp "${TMPDIR:-/tmp}/omarchy-trial-block.XXXXXX") || die "no temporary file"
+  {
+    printf '%s\n' "$BEGIN_MARK"
+    printf '/%s\n' "$ENTRY"
+    printf '    comment: Trial %s of %s. Boots once; a failure falls back to the default entry.\n' "$trial_id" "$name"
+    printf '%s\n' "$options" | sed 's/^/    /'
+    printf '    cmdline: %s\n' "$(trial_cmdline "$cmdline_base")"
+    printf '%s\n' "$END_MARK"
+  } >"$block"
+  [[ $(os_name) == Linux ]] && lock_boot_partition
+  limine_write_block "$conf" "$block" || {
+    rm -f "$block"
+    die "could not write $conf"
+  }
+  rm -f "$block"
+  staged_conf=$conf
+}
+
+efivar_file() { printf '%s/%s-%s\n' "$efivars" "$1" "$2"; }
+
+# efivar_ascii NAME GUID: an ASCII UTF-16 variable's value.
+efivar_ascii() {
+  local f
+  f=$(efivar_file "$1" "$2")
+  [[ -r $f ]] || return 1
+  tail -c +5 "$f" | tr -d '\000'
+}
+
+utf16z_format() {
+  local s=$1 i c
+  for ((i = 0; i < ${#s}; i++)); do
+    c=${s:i:1}
+    printf '\\x%02x\\x00' "'$c"
+  done
+  printf '\\x00\\x00'
+}
+
+utf16_hex() {
+  local s=$1 i
+  for ((i = 0; i < ${#s}; i++)); do
+    printf '%02x00' "'${s:i:1}"
+  done
+}
+
+efivar_unlock() { command -v chattr >/dev/null 2>&1 && chattr -i "$1" 2>/dev/null; return 0; }
+
+efivar_write_oneshot() {
+  local f tmp
+  f=$(efivar_file LoaderEntryOneShot "$BLI_GUID")
+  [[ -d $efivars ]] || die "no efivarfs at $efivars: the Limine one-shot needs EFI variables"
+  [[ -e $f ]] && efivar_unlock "$f"
+  tmp=$(mktemp) || die "no temporary file"
+  # Attributes NV|BS|RT, then the NUL-terminated UTF-16LE entry, in one write.
+  # shellcheck disable=SC2059
+  printf "\\x07\\x00\\x00\\x00$(utf16z_format "$ENTRY")" >"$tmp"
+  if ! cat "$tmp" >"$f"; then
+    rm -f "$tmp"
+    die "could not write LoaderEntryOneShot (is efivarfs read-only?)"
+  fi
+  rm -f "$tmp"
+}
+
+efivar_delete_oneshot() {
+  local f
+  f=$(efivar_file LoaderEntryOneShot "$BLI_GUID")
+  [[ -e $f ]] || return 0
+  efivar_unlock "$f"
+  rm -f "$f"
+}
+
+# U-Boot's variable file on the ESP, or nothing where the firmware stores
+# variables itself.
+uboot_var_file() {
+  local name
+  name=$(efivar_ascii RTStorageVolatile "$UBOOT_GUID") || return 1
+  [[ -n $name && $name != *..* ]] || die "U-Boot names an unusable variable file '$name'"
+  printf '%s/%s\n' "$esp" "${name#/}"
+}
+
+# Write U-Boot's runtime variable store to the file it loads at the next boot.
+limine_persist() {
+  local var_file v2f tmp magic
+  var_file=$(uboot_var_file) || return 0
+  v2f=$(efivar_file VarToFile "$UBOOT_GUID")
+  [[ -r $v2f ]] || die "U-Boot keeps variables in RAM but $v2f is unreadable"
+  tmp=$(mktemp) || die "no temporary file"
+  tail -c +5 "$v2f" >"$tmp"
+  magic=$(dd if="$tmp" bs=1 skip=8 count=7 2>/dev/null)
+  if [[ $magic != UbEfiVa ]]; then
+    rm -f "$tmp"
+    die "U-Boot's VarToFile does not hold a variable file"
+  fi
+  if [[ -f $var_file && ! -e $var_file.pre-omarchy-trial ]]; then
+    cp -p "$var_file" "$var_file.pre-omarchy-trial" 2>/dev/null
+  fi
+  write_synced "$var_file" "$tmp" || {
+    rm -f "$tmp"
+    die "could not write $var_file"
+  }
+  rm -f "$tmp"
+}
+
+file_has_oneshot() {
+  od -An -v -tx1 "$1" 2>/dev/null | tr -d ' \n' | grep -q "$(utf16_hex "$ENTRY")0000"
+}
+
+limine_arm() {
+  local got var_file
+  lock_boot_partition
+  efivar_write_oneshot
+  limine_persist
+  got=$(efivar_ascii LoaderEntryOneShot "$BLI_GUID") || got=""
+  [[ $got == "$ENTRY" ]] || die "one-shot readback: got '$got', want '$ENTRY'"
+  if var_file=$(uboot_var_file); then
+    file_has_oneshot "$var_file" || die "the one-shot is not in $var_file, so U-Boot would not see it at the next boot"
+  fi
+}
+
+limine_disarm() {
+  lock_boot_partition
+  efivar_delete_oneshot
+  limine_persist
+}
+
+limine_armed() { efivar_ascii LoaderEntryOneShot "$BLI_GUID"; }
+
+# --- GRUB ----------------------------------------------------------------------
+
+grub_env_file() { printf '%s/%s\n' "$esp" "$GRUB_ENV"; }
+
+esp_uuid() {
+  findmnt -n -o UUID --mountpoint "$esp" 2>/dev/null
+}
+
+# grub_locate FILE: "GRUBPATH UUID FSTYPE" for a local file.
+grub_locate() {
+  local file=$1 line source fstype uuid target sub="" rel
+  line=$(findmnt -n -r -o SOURCE,FSTYPE,UUID,TARGET -T "$file" 2>/dev/null | head -n 1)
+  [[ -n $line ]] || return 1
+  read -r source fstype uuid target <<<"$line"
+  if [[ $source =~ \[(/[^]]*)\]$ ]]; then
+    sub=${BASH_REMATCH[1]}
+    [[ $sub == / ]] && sub=""
+  fi
+  if [[ $target == / ]]; then
+    rel=$file
+  else
+    rel=${file#"$target"}
+  fi
+  printf '%s %s %s\n' "$sub$rel" "$uuid" "$fstype"
+}
+
+# strip_block FILE: FILE without our block and the blank line put before it.
+strip_block() {
+  awk -v begin="$BEGIN_PREFIX" -v end="$END_MARK" '
+    index($0, begin) == 1 { ours = 1; if (n > 0 && lines[n] == "") n--; next }
+    ours { if ($0 == end) ours = 0; next }
+    { lines[++n] = $0 }
+    END { for (i = 1; i <= n; i++) print lines[i] }
+  ' "$1"
+}
+
+grub_fs_module() {
+  case $1 in
+    btrfs) echo btrfs ;;
+    vfat) echo fat ;;
+    xfs) echo xfs ;;
+    *) echo ext2 ;;
+  esac
+}
+
+grub_hook_text() {
+  local uuid=$1
+  cat <<EOF
+$BEGIN_MARK
+# GRUB cannot write grubenv on btrfs, so the one-shot lives in $GRUB_ENV on the ESP.
+insmod part_gpt
+insmod fat
+if search --no-floppy --fs-uuid --set=omarchy_trial_esp $uuid; then
+    if [ -f (\$omarchy_trial_esp)/$GRUB_ENV ]; then
+        load_env -f (\$omarchy_trial_esp)/$GRUB_ENV $GRUB_VAR
+        if [ -n "\$$GRUB_VAR" ]; then
+            set default="\$$GRUB_VAR"
+            set $GRUB_VAR=
+            save_env -f (\$omarchy_trial_esp)/$GRUB_ENV $GRUB_VAR
+        fi
+    fi
+fi
+if [ -f \${config_directory}/$GRUB_CFG ]; then
+    source \${config_directory}/$GRUB_CFG
+elif [ -f \$prefix/$GRUB_CFG ]; then
+    source \$prefix/$GRUB_CFG
+fi
+$END_MARK
+EOF
+}
+
+grub_editenv() {
+  command -v grub-editenv >/dev/null 2>&1 || die "grub-editenv is missing"
+  grub-editenv "$@"
+}
+
+grub_stage() {
+  local name=$1 kernel="" initrd_file="" k_loc i_loc kpath kuuid kfs ipath iuuid ifs uuid custom hook tmp cfg
+  grep -q 'custom\.cfg' "$grub_dir/grub.cfg" 2>/dev/null ||
+    die "$grub_dir/grub.cfg does not source custom.cfg (41_custom missing); run grub-mkconfig once"
+  if [[ $name == /* ]]; then
+    kernel=$name
+  else
+    kernel=$boot_dir/vmlinuz-$name
+  fi
+  [[ -f $kernel ]] || die "no kernel at $kernel"
+  if [[ -n $initrd ]]; then
+    initrd_file=$initrd
+  else
+    local candidate base=${kernel##*/vmlinuz-}
+    for candidate in "$boot_dir/initramfs-$base.img" "$boot_dir/initrd.img-$base" "$boot_dir/initrd-$base.img"; do
+      if [[ -f $candidate ]]; then
+        initrd_file=$candidate
+        break
+      fi
+    done
+  fi
+  [[ -n $initrd_file && -f $initrd_file ]] || die "no initramfs for $kernel (give --initrd)"
+  k_loc=$(grub_locate "$kernel") || die "cannot locate $kernel for GRUB"
+  i_loc=$(grub_locate "$initrd_file") || die "cannot locate $initrd_file for GRUB"
+  read -r kpath kuuid kfs <<<"$k_loc"
+  read -r ipath iuuid ifs <<<"$i_loc"
+  [[ $kuuid == "$iuuid" ]] || die "$kernel and $initrd_file are on different filesystems"
+  [[ -n $cmdline_base ]] || cmdline_base=$(cmdline_words)
+
+  cfg=$(mktemp) || die "no temporary file"
+  {
+    echo "# Generated by omarchy-trial-boot: the trial entry, selected once via $GRUB_ENV on the ESP."
+    printf "menuentry 'Omarchy trial: %s (%s)' --class gnu-linux --id %s {\n" "${name//\'/}" "$trial_id" "$ENTRY"
+    if grep -q 'function load_video' "$grub_dir/grub.cfg" 2>/dev/null; then
+      printf '\tload_video\n\tset gfxpayload=keep\n'
+    fi
+    printf '\tinsmod gzio\n\tinsmod part_gpt\n\tinsmod %s\n' "$(grub_fs_module "$kfs")"
+    [[ $kfs == btrfs ]] && printf '\tinsmod zstd\n'
+    printf '\tsearch --no-floppy --fs-uuid --set=root %s\n' "$kuuid"
+    printf "\techo 'omarchy-trial-boot: loading %s'\n" "${name//\'/}"
+    printf '\tlinux %s %s\n' "$kpath" "$(trial_cmdline "$cmdline_base")"
+    printf '\tinitrd %s\n}\n' "$ipath"
+  } >"$cfg"
+  write_synced "$grub_dir/$GRUB_CFG" "$cfg" || die "could not write $grub_dir/$GRUB_CFG"
+  rm -f "$cfg"
+
+  uuid=$(esp_uuid)
+  [[ -n $uuid ]] || die "cannot read the ESP's filesystem UUID"
+  custom=$grub_dir/custom.cfg
+  hook=$(mktemp) || die "no temporary file"
+  grub_hook_text "$uuid" >"$hook"
+  tmp=$(mktemp) || die "no temporary file"
+  if [[ -f $custom ]]; then
+    [[ -e $custom.pre-omarchy-trial ]] || grep -q "^$BEGIN_PREFIX" "$custom" || cp -p "$custom" "$custom.pre-omarchy-trial"
+    strip_block "$custom" >"$tmp"
+  fi
+  {
+    [[ -s $tmp ]] && echo
+    cat "$hook"
+  } >>"$tmp"
+  cmp -s "$tmp" "$custom" 2>/dev/null || write_synced "$custom" "$tmp" || die "could not write $custom"
+  rm -f "$tmp" "$hook"
+
+  [[ -f $(grub_env_file) ]] || grub_editenv "$(grub_env_file)" create
+  staged_conf=$grub_dir/$GRUB_CFG
+}
+
+grub_arm() {
+  local got
+  grub_editenv "$(grub_env_file)" set "$GRUB_VAR=$ENTRY" || die "grub-editenv set failed"
+  got=$(grub_armed)
+  [[ $got == "$ENTRY" ]] || die "one-shot readback: got '$got', want '$ENTRY'"
+  sync_path "$(grub_env_file)"
+}
+
+grub_armed() {
+  [[ -f $(grub_env_file) ]] || return 1
+  grub_editenv "$(grub_env_file)" list 2>/dev/null | sed -n "s/^$GRUB_VAR=//p" | grep .
+}
+
+grub_disarm() {
+  [[ -f $(grub_env_file) ]] || return 0
+  grub_editenv "$(grub_env_file)" unset "$GRUB_VAR"
+}
+
+grub_unstage() {
+  local custom=$grub_dir/custom.cfg tmp
+  rm -f "$grub_dir/$GRUB_CFG"
+  if [[ -f $custom ]] && grep -q "^$BEGIN_PREFIX" "$custom"; then
+    tmp=$(mktemp) || die "no temporary file"
+    strip_block "$custom" >"$tmp"
+    write_synced "$custom" "$tmp"
+    rm -f "$tmp"
+  fi
+}
+
+# --- the kernel's watchdog -----------------------------------------------------
+
+# kernel_has_wdt NAME: 0 built in or module, 1 missing, 2 cannot tell.
+kernel_has_wdt() {
+  local dir found=""
+  for dir in "$modules_dir"/*/; do
+    [[ -f ${dir}pkgbase && $(cat "${dir}pkgbase") == "$1" ]] || continue
+    found=$dir
+    break
+  done
+  [[ -n $found ]] || return 2
+  grep -q '/apple_wdt\.ko' "${found}modules.builtin" 2>/dev/null && return 0
+  grep -q '/apple_wdt\.ko' "${found}modules.dep" 2>/dev/null && return 0
+  return 1
+}
+
+# --- state ---------------------------------------------------------------------
+
+pending_file() { printf '%s/pending\n' "$state_dir"; }
+
+write_pending() {
+  local f
+  f=$(pending_file)
+  mkdir -p "$state_dir" || die "cannot create $state_dir"
+  if [[ -f $f ]]; then
+    local old
+    old=$(kv_get "$f" id) || old=unknown
+    mkdir -p "$state_dir/trials/$old"
+    mv -f "$f" "$state_dir/trials/$old/pending.superseded"
+    warn "replaced the unresolved trial $old"
+  fi
+  {
+    echo "id=$trial_id"
+    echo "entry=$entry_arg"
+    echo "loader=$loader"
+    echo "esp=$esp"
+    echo "armed_at=$(date +%s)"
+    echo "armed_boot_id=$(boot_id)"
+    echo "deadline=$deadline"
+    echo "open_timeout=$open_timeout"
+    echo "watchdog=$wd_owner"
+  } >"$f"
+  sync_path "$f"
+}
+
+# record KEY=VALUE...: this trial boot's state, in /run and on the root
+# filesystem when it is writable.
+record() {
+  local kv dir
+  mkdir -p "$run_dir" 2>/dev/null
+  for kv in "$@"; do
+    printf '%s\n' "$kv" >>"$run_dir/state"
+  done
+  dir=$state_dir/trials/$trial_id
+  if mkdir -p "$dir" 2>/dev/null; then
+    for kv in "$@"; do
+      printf '%s\n' "$kv" >>"$dir/boot-$this_boot.env"
+    done 2>/dev/null
+    sync_path "$dir/boot-$this_boot.env"
+  fi
+}
+
+# --- commands ------------------------------------------------------------------
+
+trial_id=""
+deadline=$DEFAULT_DEADLINE
+open_timeout=$DEFAULT_OPEN_TIMEOUT
+wd_owner=""
+verbose=0
+append=""
+cmdline_base=""
+uki=""
+initrd=""
+force=0
+do_reboot=0
+entry_arg=""
+staged_conf=""
+this_boot=""
+
+parse_stage_options() {
+  while (($#)); do
+    case $1 in
+      --deadline) deadline=${2:-}; shift 2 ;;
+      --open-timeout) open_timeout=${2:-}; shift 2 ;;
+      --watchdog) wd_owner=${2:-}; shift 2 ;;
+      --verbose) verbose=1; shift ;;
+      --append) append=${2:-}; shift 2 ;;
+      --cmdline-base) cmdline_base=${2:-}; shift 2 ;;
+      --uki) uki=${2:-}; shift 2 ;;
+      --initrd) initrd=${2:-}; shift 2 ;;
+      --loader) loader=${2:-}; shift 2 ;;
+      --esp) esp=${2%/}; shift 2 ;;
+      --id) trial_id=$(sanitize_id "${2:-}"); shift 2 ;;
+      --force) force=1; shift ;;
+      --reboot) do_reboot=1; shift ;;
+      -h | --help) usage; exit 0 ;;
+      -*) die "unknown option $1" ;;
+      *)
+        [[ -z $entry_arg ]] || die "one entry only"
+        entry_arg=$1
+        shift
+        ;;
+    esac
+  done
+  [[ -n $entry_arg || -n $uki ]] || die "name the entry to try (see --help)"
+  [[ -n $entry_arg ]] || entry_arg=$uki
+  is_uint "$deadline" && ((deadline >= 60)) || die "--deadline must be at least 60 seconds"
+  is_uint "$open_timeout" || die "--open-timeout must be a number of seconds"
+  if ((open_timeout > 0 && open_timeout < 60)); then
+    die "--open-timeout under 60 s would reset healthy boots"
+  fi
+  case $loader in '' | limine | grub) ;; *) die "--loader is limine or grub" ;; esac
+  case $wd_owner in '' | trial | systemd | none) ;; *) die "--watchdog is trial, systemd or none" ;; esac
+  [[ $append != *omarchy.trial* ]] || die "--append must not set omarchy.trial"
+  [[ -n $trial_id ]] || trial_id=$(sanitize_id "$(date -u +%Y%m%dT%H%M%SZ)-${entry_arg##*/}")
+}
+
+cmd_stage() {
+  local mode=$1
+  shift
+  parse_stage_options "$@"
+  local on_linux=0
+  [[ $(os_name) == Linux ]] && on_linux=1
+  if ((!on_linux)); then
+    [[ -n $esp ]] || die "give --esp with the mounted ESP (for example \"/Volumes/EFI - OMARC\")"
+    [[ $mode == stage ]] || die "arm needs Linux (EFI variables); use stage from macOS and pick the entry in the Limine menu"
+  else
+    find_esp
+  fi
+  [[ -d $esp ]] || die "$esp is not a directory"
+  detect_loader
+  if ((!on_linux)) && [[ $loader != limine ]]; then
+    die "from macOS only a Limine menu on the ESP can be staged"
+  fi
+
+  if [[ -z $wd_owner ]]; then
+    # The watch unit can hold the watchdog only where it is installed: this
+    # root, for a trial of another kernel on this system.
+    if ((on_linux)) && [[ -f $unit_dir/omarchy-trial-boot-watch.service && -z $cmdline_base ]]; then
+      wd_owner=trial
+    else
+      wd_owner=systemd
+    fi
+  fi
+
+  # Whatever the trial's own settings, U-Boot's watchdog is running when the
+  # kernel starts, and only apple_wdt takes it over.
+  if ((on_linux)); then
+    local wdt_status kname=${entry_arg##*/}
+    kname=${kname#omarchy_}
+    kname=${kname%.efi}
+    kname=${kname#vmlinuz-}
+    kernel_has_wdt "$kname"
+    wdt_status=$?
+    if ((wdt_status == 1)); then
+      ((force)) || die "$kname has no apple_wdt: the watchdog U-Boot leaves running would reset every boot of it about 60 s in (use --force to try anyway)"
+      warn "$kname has no apple_wdt; expect a watchdog reset about 60 s into the boot"
+    elif ((wdt_status == 2)); then
+      warn "cannot tell whether $kname builds apple_wdt (no $modules_dir/*/pkgbase names it)"
+    fi
+  fi
+
+  if [[ $mode == arm ]] && ((EUID != 0)) && [[ -z ${OMARCHY_TRIAL_STATE:-} ]]; then
+    die "arm needs root"
+  fi
+  case $loader in
+    limine) limine_stage "$entry_arg" ;;
+    grub) grub_stage "$entry_arg" ;;
+  esac
+  say "Staged trial $trial_id: entry '$ENTRY' in $staged_conf"
+
+  if [[ $mode == arm ]]; then
+    case $loader in
+      limine) limine_arm ;;
+      grub) grub_arm ;;
+    esac
+    write_pending
+    say "Armed: the next boot, and only the next, starts '$ENTRY'."
+    say "Deadline ${deadline} s, watchdog: $wd_owner (open timeout ${open_timeout} s), panic=10."
+    say "After it, run 'sudo omarchy-trial-boot collect' on the known-good boot (it also runs at boot)."
+    if ((do_reboot)); then
+      sync
+      ${reboot_cmd:-systemctl reboot}
+    fi
+  else
+    say "Not armed: pick '$ENTRY' in the boot menu to try it once."
+  fi
+}
+
+cmd_disarm() {
+  local on_linux=0
+  [[ $(os_name) == Linux ]] && on_linux=1
+  while (($#)); do
+    case $1 in
+      --esp) esp=${2%/}; shift 2 ;;
+      --loader) loader=${2:-}; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  if ((on_linux)); then find_esp; fi
+  [[ -n $esp ]] || die "give --esp"
+  detect_loader
+  case $loader in
+    limine)
+      ((on_linux)) && limine_disarm
+      local conf empty
+      if conf=$(limine_conf); then
+        empty=$(mktemp)
+        limine_write_block "$conf" "$empty"
+        rm -f "$empty"
+      fi
+      ;;
+    grub)
+      grub_disarm
+      grub_unstage
+      ;;
+  esac
+  if ((on_linux)) && [[ -f $(pending_file) ]]; then
+    local id
+    id=$(kv_get "$(pending_file)" id) || id=unknown
+    mkdir -p "$state_dir/trials/$id"
+    mv -f "$(pending_file)" "$state_dir/trials/$id/pending.disarmed"
+  fi
+  say "Disarmed: no one-shot, no trial entry."
+}
+
+wd_release() {
+  ((wd_open)) || return 0
+  # Magic close: stop the hardware watchdog on the way out.
+  printf 'V' >&3 2>/dev/null
+  exec 3>&-
+  wd_open=0
+}
+
+wd_open=0
+deadline_passed=0
+
+pid1_answers() {
+  ((pid1_check)) || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  timeout 10 systemctl show -p Version --value >/dev/null 2>&1
+}
+
+trial_reboot() {
+  local how=${1:-}
+  if [[ -n $reboot_cmd ]]; then
+    $reboot_cmd $how
+    return
+  fi
+  if [[ $how == force ]]; then
+    systemctl reboot --force --force
+  else
+    systemctl --no-block reboot
+  fi
+}
+
+cmd_watch() {
+  trial_id=$(cmdline_value omarchy.trial) || exit 0
+  trial_id=$(sanitize_id "$trial_id")
+  this_boot=$(boot_id)
+  local trial_deadline own_wd=0 now last_sync=-100 last_pid1 silent=0
+  trial_deadline=$(cmdline_value omarchy.trial_deadline) || trial_deadline=$DEFAULT_DEADLINE
+  is_uint "$trial_deadline" || trial_deadline=$DEFAULT_DEADLINE
+  cmdline_has systemd.watchdog_sec=0 && own_wd=1
+  now=$(uptime_s)
+  last_pid1=$now
+  record "trial=$trial_id" "boot_id=$this_boot" "watch_started=$now" "deadline=$trial_deadline"
+  log "trial $trial_id: reboot to the default entry unless boot-complete is reached by ${trial_deadline} s of uptime"
+
+  # Stopped before a result (the owner rebooting by hand): release the
+  # watchdog cleanly. After a missed deadline it stays armed, so a reboot that
+  # stalls is reset by the hardware.
+  deadline_passed=0
+  trap 'if ((!deadline_passed)); then wd_release; fi; exit 0' TERM INT
+  if ((own_wd)); then
+    if [[ -e $watchdog_dev ]] && exec 3>"$watchdog_dev"; then
+      wd_open=1
+      record "watchdog=held"
+      log "trial $trial_id: holding $watchdog_dev"
+    else
+      record "watchdog=unavailable"
+      log "trial $trial_id: cannot open $watchdog_dev; only the deadline protects this boot"
+    fi
+  fi
+
+  while :; do
+    now=$(uptime_s)
+    if [[ -e $run_dir/complete ]]; then
+      record "result=complete" "result_at=$now"
+      wd_release
+      log "trial $trial_id: reached boot-complete at ${now} s; watchdog released"
+      exit 0
+    fi
+    if [[ -e $run_dir/hold ]]; then
+      record "result=held" "result_at=$now"
+      wd_release
+      log "trial $trial_id: held by the owner at ${now} s; no deadline, watchdog released"
+      exit 0
+    fi
+    if ((now >= trial_deadline)); then
+      deadline_passed=1
+      record "result=deadline" "result_at=$now"
+      command -v journalctl >/dev/null 2>&1 && journalctl --sync >/dev/null 2>&1
+      sync
+      log "trial $trial_id: missed its ${trial_deadline} s deadline; rebooting to the default entry"
+      # Stop feeding: if the reboot stalls, the hardware resets the Mac.
+      trial_reboot
+      if is_uint "$escalate_after" && ((escalate_after > 0)); then
+        sleep "$escalate_after"
+        log "trial $trial_id: the reboot stalled; forcing it"
+        trial_reboot force
+      fi
+      exit 0
+    fi
+    if ((wd_open)); then
+      if pid1_answers; then
+        last_pid1=$now
+        silent=0
+      elif ((now - last_pid1 >= 30 && !silent)); then
+        silent=1
+        log "trial $trial_id: PID 1 has not answered for 30 s; no longer feeding the watchdog"
+      fi
+      ((silent)) || printf '1' >&3 2>/dev/null
+    fi
+    if ((now - last_sync >= 15)); then
+      # A crash loses what is not on disk; keep the trial's journal there.
+      command -v journalctl >/dev/null 2>&1 && journalctl --sync >/dev/null 2>&1
+      last_sync=$now
+    fi
+    sleep "$tick" &
+    wait $! 2>/dev/null
+  done
+}
+
+cmd_complete() {
+  trial_id=$(cmdline_value omarchy.trial) || exit 0
+  trial_id=$(sanitize_id "$trial_id")
+  this_boot=$(boot_id)
+  local check failed=0
+  if [[ -d $checks_dir ]]; then
+    for check in "$checks_dir"/*; do
+      [[ -f $check && -x $check ]] || continue
+      if ! timeout 120 "$check"; then
+        log "trial $trial_id: check ${check##*/} failed"
+        failed=1
+      fi
+    done
+  fi
+  if ((failed)); then
+    record "checks=failed"
+    log "trial $trial_id: not complete; the deadline will reboot it"
+    exit 1
+  fi
+  mkdir -p "$run_dir"
+  : >"$run_dir/complete"
+  record "complete_at=$(uptime_s)"
+  log "trial $trial_id: boot-complete"
+}
+
+cmd_hold() {
+  trial_id=$(cmdline_value omarchy.trial) || die "this is not a trial boot"
+  mkdir -p "$run_dir" || die "cannot write $run_dir"
+  : >"$run_dir/hold"
+  say "Held: the watch unit stops the deadline and releases the watchdog within ${tick} s."
+  say "Reboot when done; the next boot is the default entry."
+}
+
+print_trial_results() {
+  local dir f id result
+  [[ -d $state_dir/trials ]] || return 0
+  for dir in "$state_dir"/trials/*/; do
+    [[ -d $dir ]] || continue
+    id=${dir%/}
+    id=${id##*/}
+    result=""
+    for f in "$dir"boot-*.env; do
+      [[ -f $f ]] || continue
+      result="$result $(kv_get "$f" result || echo no-result)"
+    done
+    [[ -f ${dir}verdict ]] && result="$result | $(head -n 1 "${dir}verdict")"
+    say "  $id:${result:- no trial boot recorded}"
+  done
+}
+
+cmd_status() {
+  local on_linux=0 conf armed this
+  [[ $(os_name) == Linux ]] && on_linux=1
+  while (($#)); do
+    case $1 in
+      --esp) esp=${2%/}; shift 2 ;;
+      --loader) loader=${2:-}; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  if ((on_linux)); then find_esp; fi
+  [[ -n $esp ]] || die "give --esp"
+  detect_loader
+  say "Loader: $loader (ESP $esp)"
+  case $loader in
+    limine)
+      if conf=$(limine_conf); then
+        say "Menu: $conf"
+        if [[ -n $(limine_block "$conf") ]]; then
+          say "Trial entry:"
+          limine_block "$conf" | grep -E '^[[:space:]]*(comment|path|cmdline):' | sed 's/^[[:space:]]*/    /'
+        else
+          say "Trial entry: none"
+        fi
+      fi
+      if ((on_linux)); then
+        armed=$(limine_armed) || armed=""
+        say "One-shot (LoaderEntryOneShot): ${armed:-none}"
+        say "Booted entry (LoaderEntrySelected): $(efivar_ascii LoaderEntrySelected "$BLI_GUID" || echo unknown)"
+        local var_file
+        if var_file=$(uboot_var_file); then
+          if file_has_oneshot "$var_file"; then
+            say "U-Boot variable file $var_file: holds the one-shot"
+          else
+            say "U-Boot variable file $var_file: no one-shot"
+          fi
+        fi
+      fi
+      ;;
+    grub)
+      if [[ -f $grub_dir/$GRUB_CFG ]]; then
+        say "Trial entry: $grub_dir/$GRUB_CFG"
+        sed -n 's/^[[:space:]]*linux /    linux /p' "$grub_dir/$GRUB_CFG"
+      else
+        say "Trial entry: none"
+      fi
+      armed=$(grub_armed) || armed=""
+      say "One-shot ($GRUB_VAR in $(grub_env_file)): ${armed:-none}"
+      ;;
+  esac
+  ((on_linux)) || return 0
+
+  if [[ -f $(pending_file) ]]; then
+    say "Pending trial: $(kv_get "$(pending_file)" id) (entry $(kv_get "$(pending_file)" entry), armed $(date -d "@$(kv_get "$(pending_file)" armed_at)" 2>/dev/null || kv_get "$(pending_file)" armed_at))"
+  else
+    say "Pending trial: none"
+  fi
+  if this=$(cmdline_value omarchy.trial); then
+    say "This boot: TRIAL $this (deadline $(cmdline_value omarchy.trial_deadline || echo "$DEFAULT_DEADLINE") s, uptime $(uptime_s) s)"
+    if [[ -f $run_dir/state ]]; then
+      sed 's/^/    /' "$run_dir/state"
+    else
+      say "    the watch unit has recorded nothing (not installed on this root?)"
+    fi
+    [[ -e $run_dir/complete ]] && say "    boot-complete: reached"
+    [[ -e $run_dir/hold ]] && say "    held by the owner"
+  else
+    say "This boot: default entry"
+  fi
+  local wd=/sys/class/watchdog/watchdog0
+  if [[ -d $wd ]]; then
+    say "Watchdog: $(cat "$wd/identity" 2>/dev/null) state=$(cat "$wd/state" 2>/dev/null || echo ?) timeout=$(cat "$wd/timeout" 2>/dev/null || echo ?) s open_timeout=$(cat /sys/module/watchdog/parameters/open_timeout 2>/dev/null || echo ?) s"
+  else
+    say "Watchdog: none (apple_wdt not bound)"
+  fi
+  say "Panic reboot: panic=$(cat /proc/sys/kernel/panic 2>/dev/null || echo ?) s"
+  say "Trials:"
+  print_trial_results
+}
+
+# --- collect -------------------------------------------------------------------
+
+# find_trial_boots ID: boot ids the trial ran as, newest last.
+find_trial_boots() {
+  local id=$1 f bid seen=""
+  for f in "$state_dir/trials/$id"/boot-*.env; do
+    [[ -f $f ]] || continue
+    bid=$(kv_get "$f" boot_id) || continue
+    seen="$seen $bid"
+  done
+  if [[ -z $seen ]] && command -v journalctl >/dev/null 2>&1; then
+    # The watch unit never ran there: look for the marker in recent kernel logs.
+    for bid in $(journalctl --list-boots --no-pager -q 2>/dev/null | awk '{ print $2 }' | tail -n 6); do
+      if journalctl -b "$bid" -k -o cat --no-pager -q 2>/dev/null | grep -m1 -qF "omarchy.trial=$id"; then
+        seen="$seen $bid"
+      fi
+    done
+  fi
+  printf '%s\n' "${seen# }"
+}
+
+cmd_collect() {
+  local out="" quiet=0
+  while (($#)); do
+    case $1 in
+      --out) out=${2:-}; shift 2 ;;
+      --quiet) quiet=1; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  local pending
+  pending=$(pending_file)
+  if [[ ! -f $pending ]]; then
+    ((quiet)) || say "No pending trial."
+    exit 0
+  fi
+  trial_id=$(kv_get "$pending" id) || die "$pending names no trial"
+  trial_id=$(sanitize_id "$trial_id")
+  if [[ $(cmdline_value omarchy.trial 2>/dev/null) == "$trial_id" ]]; then
+    die "this is the trial boot itself; collect on the next boot"
+  fi
+  if [[ $(kv_get "$pending" armed_boot_id) == "$(boot_id)" ]]; then
+    say "Trial $trial_id is armed; it runs at the next reboot."
+    exit 0
+  fi
+
+  loader=$(kv_get "$pending" loader) || loader=""
+  esp=$(kv_get "$pending" esp) || esp=""
+  local still_armed=""
+  case $loader in
+    limine) still_armed=$(limine_armed 2>/dev/null) || still_armed="" ;;
+    grub) [[ -n $esp ]] && still_armed=$(grub_armed 2>/dev/null) || still_armed="" ;;
+  esac
+
+  local dir=$state_dir/trials/$trial_id stamp
+  stamp=$(date +%Y%m%dT%H%M%S)
+  [[ -n $out ]] || out=$dir/collected-$stamp
+  mkdir -p "$out" || die "cannot create $out"
+  chmod 700 "$out" 2>/dev/null
+  cp -p "$pending" "$out/pending.env"
+  cp -p "$dir"/boot-*.env "$out/" 2>/dev/null
+  cat "$proc_cmdline" >"$out/cmdline-now.txt" 2>/dev/null
+
+  local boots bid result="" verdict detail="" have_journal=0
+  boots=$(find_trial_boots "$trial_id")
+  if command -v journalctl >/dev/null 2>&1; then
+    have_journal=1
+    journalctl --list-boots --no-pager >"$out/boots.txt" 2>&1
+    for bid in $boots; do
+      journalctl -b "$bid" -o short-monotonic --no-pager >"$out/journal-$bid.txt" 2>&1
+      journalctl -b "$bid" -k -o short-monotonic --no-pager >"$out/kernel-$bid.txt" 2>&1
+      journalctl -b "$bid" -p warning -o short-monotonic --no-pager >"$out/warnings-$bid.txt" 2>&1
+    done
+  fi
+  local pdir n=0
+  for pdir in $pstore_dirs; do
+    [[ -d $pdir ]] || continue
+    if [[ -n $(ls -A "$pdir" 2>/dev/null) ]]; then
+      mkdir -p "$out/pstore"
+      cp -a "$pdir"/. "$out/pstore/" 2>/dev/null
+      n=$((n + 1))
+    fi
+  done
+
+  for bid in $boots; do
+    local f
+    for f in "$dir"/boot-*.env; do
+      [[ -f $f && $(kv_get "$f" boot_id) == "$bid" ]] || continue
+      result=$(kv_get "$f" result) || result=""
+    done
+  done
+
+  if [[ -n $still_armed ]]; then
+    verdict="NOT ATTEMPTED"
+    detail="The one-shot is still armed after a reboot: the loader never consumed it (Limine too old for LoaderEntryOneShot, or U-Boot did not load its variable file). It has been cleared, so the next boot does not start the trial by surprise."
+    case $loader in
+      limine) (limine_disarm) 2>/dev/null ;;
+      grub) (grub_disarm) 2>/dev/null ;;
+    esac
+  elif [[ -z $boots ]]; then
+    verdict="NO TRIAL BOOT REACHED THE ROOT FILESYSTEM"
+    detail="The loader took the one-shot, but no boot of the trial was recorded: it stopped in the kernel, device tree or initramfs and panic=10 or the watchdog reset it (or a different entry was picked by hand). Its messages reach only a screen or serial console; boot it with --verbose and watch."
+  else
+    case $result in
+      complete)
+        verdict="PASSED"
+        detail="The trial reached boot-complete."
+        ;;
+      deadline)
+        verdict="FAILED: MISSED THE DEADLINE"
+        detail="The trial booted but did not reach boot-complete in time, and omarchy-trial-boot rebooted it. See failed units in its journal."
+        ;;
+      held)
+        verdict="HELD"
+        detail="The owner stopped the deadline on the trial boot."
+        ;;
+      *)
+        verdict="CRASHED OR HUNG"
+        detail="The trial reached the root filesystem, then rebooted without a recorded result: a panic (panic=10) or a watchdog reset. The journal ends where its last write reached the disk."
+        ;;
+    esac
+  fi
+
+  {
+    say "Trial $trial_id: $verdict"
+    say "$detail"
+    say "Entry: $(kv_get "$pending" entry) (loader $loader)"
+    say "Trial boots: ${boots:-none}"
+    ((n > 0)) && say "pstore records: copied to pstore/" || say "pstore records: none (Apple Silicon Macs have no ramoops region, so none are expected)"
+    if ((have_journal)); then
+      for bid in $boots; do
+        say ""
+        say "Boot $bid, kernel and boot errors:"
+        grep -E -i 'Kernel panic|Oops|BUG:|Unable to handle|Call trace|watchdog|hung_task|rcu.*stall|segfault|Failed to start|emergency|timed out' \
+          "$out/journal-$bid.txt" 2>/dev/null | head -n 40 | sed 's/^/  /'
+        say "Last lines:"
+        tail -n 15 "$out/journal-$bid.txt" 2>/dev/null | sed 's/^/  /'
+      done
+    fi
+    say ""
+    say "Saved in $out"
+  } >"$out/summary.txt"
+  cat "$out/summary.txt"
+  printf '%s\n' "$verdict" >"$dir/verdict"
+  mv -f "$pending" "$dir/pending.env"
+  sync_path "$dir"
+}
+
+main() {
+  local cmd=${1:-}
+  (($#)) && shift
+  case $cmd in
+    arm) cmd_stage arm "$@" ;;
+    stage) cmd_stage stage "$@" ;;
+    disarm) cmd_disarm "$@" ;;
+    status) cmd_status "$@" ;;
+    collect) cmd_collect "$@" ;;
+    hold) cmd_hold "$@" ;;
+    watch) cmd_watch "$@" ;;
+    complete) cmd_complete "$@" ;;
+    version | --version) say "$me $VERSION" ;;
+    '' | help | -h | --help) usage ;;
+    *) die "unknown command $cmd (see --help)" ;;
+  esac
+}
+
+main "$@"
