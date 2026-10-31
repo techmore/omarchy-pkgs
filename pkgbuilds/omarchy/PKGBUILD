@@ -13,7 +13,9 @@ pkgname='omarchy'
 _tag='v4.5.0-rc2'
 _commit='5978d93ae7da0a325b7493501911e3f1266cadd3'
 pkgver=4.5.0rc2
-pkgrel=1
+# 1.1: the Mac mini M4 developer image's rebuild of the same source, which adds
+# the source-revision file the image builder's candidate importer requires.
+pkgrel=1.1
 pkgdesc='Beautiful, modern, and opinionated Arch Linux by DHH'
 # The payload is architecture-independent, but the dependency set is not: the
 # boot stack differs per architecture (see depends_x86_64 / depends_aarch64),
@@ -182,4 +184,8 @@ package() {
 
   # Runtime version file.
   install -Dm644 version "$pkgdir/usr/share/omarchy/version"
+
+  # The commit this package was built from, as the Mac image builder's candidate
+  # importer (omarchy-mac-installer image-builder/builder/candidate_set.py) reads it.
+  printf '%s\n' "$_commit" | install -Dm644 /dev/stdin "$pkgdir/usr/share/doc/omarchy/source-revision"
 }

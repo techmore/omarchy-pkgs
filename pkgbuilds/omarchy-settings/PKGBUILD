@@ -13,7 +13,9 @@ pkgname='omarchy-settings'
 _tag='v4.5.0-rc2'
 _commit='5978d93ae7da0a325b7493501911e3f1266cadd3'
 pkgver=4.5.0rc2
-pkgrel=1
+# 1.1: the Mac mini M4 developer image's rebuild of the same source, which adds
+# the source-revision file the image builder's candidate importer requires.
+pkgrel=1.1
 pkgdesc='Omarchy user defaults, /etc/skel content, fonts, plymouth theme, and support helpers'
 # Arch-specific because the shipped /etc tree is not the same on every
 # architecture for older sources: their zram and oomd drop-ins belong to the
@@ -535,4 +537,8 @@ EOF
   install -Dm755 bin/omarchy-upload-log "$pkgdir/usr/bin/omarchy-upload-log"
   install -Dm755 bin/omarchy-debug      "$pkgdir/usr/bin/omarchy-debug"
   install -Dm755 bin/omarchy-debug-idle "$pkgdir/usr/bin/omarchy-debug-idle"
+
+  # The commit this package was built from, as the Mac image builder's candidate
+  # importer (omarchy-mac-installer image-builder/builder/candidate_set.py) reads it.
+  printf '%s\n' "$_commit" | install -Dm644 /dev/stdin "$pkgdir/usr/share/doc/omarchy-settings/source-revision"
 }
