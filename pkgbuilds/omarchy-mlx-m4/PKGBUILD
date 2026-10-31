@@ -6,7 +6,10 @@
 # mesa aurora-wip) admits G16G since 662048cacc83 ("asahi: enable native G16G on
 # the shared AGX3 path"). omarchy-mlx-vulkan-aurora takes omarchy-mlx-vulkan's
 # place and points omarchy-mlx's private ICD path at the system vulkan-aurora
-# driver, so MLX and the desktop run one Honeykrisp build.
+# driver, so MLX and the desktop run one Honeykrisp build. That driver reports
+# VK_DRIVER_ID_AURORA_BOREALIS, which omarchy-mlx 0.7.28 refuses as a non-Apple
+# driver; a drirc entry for the mlx-omarchy engine makes it report the Honeykrisp
+# ID to MLX only (techmore/omarchy-mlx 3a0ee883 accepts Borealis in the source).
 #
 # omarchy-mlx-m4-bench installs the fixed release-gate benchmark from
 # techmore/omarchy-mlx m4-mini-bench and the stack manifest it reads to record
@@ -28,11 +31,13 @@ checkdepends=('python')
 source=("m4_mini_bench-${_bench_commit:0:12}.py::$_raw/scripts/m4_mini_bench.py"
         "m4-mini-bench-${_bench_commit:0:12}.md::$_raw/docs/m4-mini-bench.md"
         stack.json
-        omarchy-mlx-m4-bench)
+        omarchy-mlx-m4-bench
+        60-omarchy-mlx-honeykrisp-id.conf)
 sha256sums=('2dc1e7a6d71d8c5f43414ad21c2206f9e88ae34426685323ab410fca4554ebb9'
             'e4988dafe0dca047b79703251e46afd6276376d11281a82a5e4b2af646cfcc38'
             'f87f9753ba15c9a30c40f9bfbd8ae2fa805b93247425c247c360746628fc31dc'
-            '974a86fa75d28425f5ccad9c2a037583e1db89adb1325567c815442559b633c8')
+            '974a86fa75d28425f5ccad9c2a037583e1db89adb1325567c815442559b633c8'
+            '99cf2bf37cd6b48d515d667eeacbe9f026727e03d83887e8f0fe5947551bb433')
 
 check() {
   python -I "$srcdir/m4_mini_bench-${_bench_commit:0:12}.py" --self-test
@@ -46,6 +51,8 @@ for name in ("linux-aurora", "m1n1-aurora", "vulkan-aurora", "omarchy-mlx"):
     assert re.fullmatch(r"[0-9a-f]{40}", entry["commit"]), name
     assert re.fullmatch(r"([0-9]+:)?[^-\s]+-[0-9.]+", entry["version"]), name
 PY
+  python -I -c 'import sys, xml.etree.ElementTree as t; t.parse(sys.argv[1])' \
+    "$srcdir/60-omarchy-mlx-honeykrisp-id.conf"
 }
 
 package_omarchy-mlx-vulkan-aurora() {
@@ -62,6 +69,8 @@ package_omarchy-mlx-vulkan-aurora() {
   install -d "$pkgdir/usr/lib/omarchy-mlx/vulkan"
   ln -s /usr/share/vulkan/icd.d/asahi_icd.aarch64.json \
     "$pkgdir/usr/lib/omarchy-mlx/vulkan/honeykrisp_icd.aarch64.json"
+  install -Dm644 "$srcdir/60-omarchy-mlx-honeykrisp-id.conf" \
+    "$pkgdir/usr/share/drirc.d/60-omarchy-mlx-honeykrisp-id.conf"
 }
 
 package_omarchy-mlx-m4-bench() {
