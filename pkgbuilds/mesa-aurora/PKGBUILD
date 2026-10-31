@@ -3,21 +3,20 @@ pkgname=('mesa-aurora' 'vulkan-aurora')
 epoch=1
 # Development versions sort by real UTC date, full reachable commit count,
 # then source hash. Hash-only same-day repins can downgrade existing packages.
-pkgver=26.3.0_devel.20261029.231476.672657e05e6
-pkgrel=2
+pkgver=26.3.0_devel.20261031.231461.8990cdb219b
+pkgrel=1
 pkgdesc='Aurora Asahi Gallium, Zink and Honeykrisp'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
-url='https://github.com/omacom/mesa'
+url='https://github.com/aurora-silicon/mesa'
 license=('MIT')
-# integration/aurora after omacom/mesa#19: the upstream Mesa and aurora-wip sync,
-# with M3 occlusion availability kept on the queued store.
-# Full-history `git rev-list --count` for this pin is 231476 (not first-parent).
-# Its G15 occlusion fix was checked on M3 Pro with a reproducer, not this package's
-# build or hardware qualification.
-_commit=672657e05e6b382a0203975f7a26c46f9a674973
-_src=mesa-omacom
-# Matched to the DRM UAPI in omacom/linux-aurora integration/aurora.
+# aurora-silicon/mesa aurora-wip, which admits the Mac mini M4 GPU (chip 0x8132,
+# G16G; 662048cacc83 "asahi: enable native G16G on the shared AGX3 path").
+# Full-history reachable commit count for this pin is 231461 (GitHub commit list).
+_commit=8990cdb219b296b713b41350bcb1f6522ce062fb
+_src=mesa-$_commit
+# Matched to the DRM UAPI of techmore/linux-m1pro-touchid elementaryos-mseries
+# (Aurora aurora-wip), the kernel linux-aurora pins.
 # The drivers never link SPIRV-Tools, which Arch Linux ARM moves without a
 # versioned soname. Asahi needs LLVM only to precompile its CL shaders, so a
 # first build makes those compilers and the packaged one uses them. llvmpipe, the
@@ -32,10 +31,8 @@ makedepends=('git' 'meson' 'ninja' 'python-mako' 'python-yaml' 'python-packaging
              'libx11' 'libxcb' 'libxext' 'libxfixes' 'libxrandr' 'libxshmfence' 'libxxf86vm'
              'wayland' 'wayland-protocols' 'vulkan-headers' 'vulkan-icd-loader' 'libdisplay-info'
              'lm_sensors' 'zlib' 'zstd' 'xcb-util-keysyms')
-# Use a distinct VCS cache name when changing repository origin. Existing
-# makepkg caches named mesa belong to Aurora and reject a different URL.
-source=("$_src::git+$url.git#commit=$_commit")
-sha256sums=('SKIP')
+source=("$_src.tar.gz::$url/archive/$_commit.tar.gz")
+sha256sums=('0c7c407947449a0d8b567db3eee14de27b5aee660a8fbb8e7edf48a61a3f96f5')
 options=('!debug')
 _options=(-Dplatforms=x11,wayland
   -Dgallium-drivers=asahi,zink,softpipe,llvmpipe -Dvulkan-drivers=asahi

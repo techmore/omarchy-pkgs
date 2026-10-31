@@ -1,30 +1,35 @@
-# omacom/m1n1; ordinary updates refresh ESP Stage 2, never enroll Stage 1.
+# techmore/m1n1 elementaryos-mseries: Aurora m1n1 plus the Mac mini M4 GPU, PMP and
+# ANS storage handoff and inline NVMe. Ordinary updates refresh ESP Stage 2, never
+# enroll Stage 1.
 pkgname=m1n1-aurora
-pkgver=1.6.1.aurora22
+pkgver=1.6.1.aurora90
 pkgrel=1
-pkgdesc='Omarchy Apple Silicon bootloader from omacom/m1n1'
+pkgdesc='Omarchy Apple Silicon bootloader from techmore/m1n1'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
-url='https://github.com/omacom/m1n1'
+url='https://github.com/techmore/m1n1'
 license=('MIT' 'GPL-2.0-only' 'CC0-1.0' 'OFL-1.1-RFN' 'Zlib' 'BSD-2-Clause OR GPL-2.0-or-later' 'BSD-3-Clause OR GPL-2.0-or-later' 'MIT OR Apache-2.0')
 provides=("m1n1=$pkgver" "m1n1-neo=$pkgver")
 conflicts=('m1n1' 'aura' 'm1n1-neo')
 # Only migrate the downstream providers, never the stock Asahi package.
 replaces=('aura' 'm1n1-neo')
-makedepends=('git' 'clang' 'lld' 'llvm' 'rustup' 'make' 'python')
+makedepends=('clang' 'lld' 'llvm' 'rustup' 'make' 'python')
 options=('!strip' '!debug')
-_commit=bc79acc434e612ffcb95bfc7cb2fd7543afac5f2
-source=("m1n1::git+$url.git#commit=$_commit"
+_commit=fc75c0e0c7fe1c058b638201fa45526716acecd1
+_srcname=m1n1-$_commit
+source=("$_srcname.tar.gz::$url/archive/$_commit.tar.gz"
         build-qualification.json validate-qualification.py
         bootlogo_48.bin bootlogo_128.bin bootlogo_256.bin)
-sha256sums=('SKIP' '858cebe85070161109b3ce4cc97d14e70d0ea09bbda282fa9666b730f9cabce1'
+sha256sums=('4a19793c1bf77bfe49f168cc1daa6ceaa9babff0f4f034bca780dc08bc2eb8e2'
+            '858cebe85070161109b3ce4cc97d14e70d0ea09bbda282fa9666b730f9cabce1'
             '43578b83ebea180319b64c9b63377dab6148e997e6f75fd4abcb325484f7ca95'
             '6668050653645711ad7523fe2abeb4cbe85a92c875f3eec754b6db23cea2191c'
             'b19cb017645c7a9068ea0be9b6bb394131d7ca11b28093cf6caa1ffca74b0a4e'
             '9c659b392aacfa31c62c638003d2257abfdbe17919b5c90cde4c4e62f87addab')
 
 prepare() {
-  [[ $(git -C "$srcdir/m1n1" rev-parse HEAD) == "$_commit" ]]
+  # The archive has no .git; the checksum pins the tree and the tag names it.
+  ln -sfn "$_srcname" "$srcdir/m1n1"
   rustup toolchain install 1.89.0 --profile minimal --target aarch64-unknown-none-softfloat
   # Preserve this package's existing artwork; only its source changes.
   for size in 48 128 256; do
@@ -34,7 +39,7 @@ prepare() {
 
 build() {
   cd "$srcdir/m1n1"
-  export RUSTUP_TOOLCHAIN=1.89.0
+  export RUSTUP_TOOLCHAIN=1.89.0 M1N1_VERSION_TAG="v$pkgver-${_commit:0:12}"
   make clean
   make -j"${OMARCHY_BUILD_JOBS:-10}" EXTRA_CFLAGS=-Os RELEASE=1 CHAINLOADING=1 USE_CLANG=1
   install -Dm644 build/m1n1.bin "$srcdir/stage1/m1n1-raw.bin"
