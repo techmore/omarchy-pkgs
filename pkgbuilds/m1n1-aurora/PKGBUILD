@@ -1,10 +1,11 @@
 # techmore/m1n1 elementaryos-mseries: Aurora m1n1 plus the Mac mini M4 GPU, PMP and
 # ANS storage handoff, inline NVMe, the J773g HDMI (dcpext0) handoff and the
 # display coprocessors' __OS_LOG reservations. Ordinary updates refresh ESP Stage 2, never
-# enroll Stage 1.
+# enroll Stage 1. The M4 Mac mini's Stage 1 is Gravity Linux's m1n1 built NO_DISPLAY
+# (GravityLinux/installer 486e81b), the one that boots a J773g.
 pkgname=m1n1-aurora
 pkgver=1.6.1.aurora90
-pkgrel=2
+pkgrel=3
 pkgdesc='Omarchy Apple Silicon bootloader from techmore/m1n1'
 arch=('aarch64')
 groups=('omarchy-platform-apple-silicon')
@@ -18,10 +19,13 @@ makedepends=('clang' 'lld' 'llvm' 'rustup' 'make' 'python')
 options=('!strip' '!debug')
 _commit=aac818930d32031d238990a221644de76b7a50d4
 _srcname=m1n1-$_commit
+_gravity_commit=950e6b7f268e71cf77889f27a760782bf898b651
 source=("$_srcname.tar.gz::$url/archive/$_commit.tar.gz"
+        "gravity-bootloader-$_gravity_commit.tar.gz::https://github.com/GravityLinux/bootloader/archive/$_gravity_commit.tar.gz"
         build-qualification.json validate-qualification.py
         bootlogo_48.bin bootlogo_128.bin bootlogo_256.bin)
 sha256sums=('ab3073c19a34bc41c33cd9fffab7b26a087b7e7c1077671f3b99cf6e66a2498e'
+            'db5f862f32327bc33574e5e163c311dfee3ca66b89bf028b205756ef96fe94f1'
             '22fd9c48f2da6395a7884bea397817c105762d3bf5abbe38a809de554fdaf3f1'
             '43578b83ebea180319b64c9b63377dab6148e997e6f75fd4abcb325484f7ca95'
             '6668050653645711ad7523fe2abeb4cbe85a92c875f3eec754b6db23cea2191c'
@@ -47,6 +51,11 @@ build() {
   install -Dm644 build/m1n1.macho "$srcdir/stage1/m1n1.macho"
   make clean
   make -j"${OMARCHY_BUILD_JOBS:-10}" EXTRA_CFLAGS=-Os RELEASE=1 CHAINLOADING=1 ESP_STAGE2=1 USE_CLANG=1
+
+  cd "$srcdir/bootloader-$_gravity_commit"
+  make -j"${OMARCHY_BUILD_JOBS:-10}" RELEASE=1 CHAINLOADING=1 NO_DISPLAY=1 USE_CLANG=1
+  grep -q 'display: NO_DISPLAY!' build/m1n1.bin
+  install -Dm644 build/m1n1.bin "$srcdir/stage1/gravity-m1n1.bin"
 }
 
 package() {
@@ -60,6 +69,9 @@ package() {
   ln -s ../asahi-boot/m1n1.bin "$pkgdir/usr/lib/m1n1-neo/m1n1.bin"
   install -Dm644 "$srcdir/stage1/m1n1-raw.bin" "$pkgdir/usr/share/m1n1-aurora/stage1/m1n1-raw.bin"
   install -Dm644 "$srcdir/stage1/m1n1.macho" "$pkgdir/usr/share/m1n1-aurora/stage1/m1n1.macho"
+  install -Dm644 "$srcdir/stage1/gravity-m1n1.bin" "$pkgdir/usr/share/m1n1-aurora/stage1/gravity-m1n1.bin"
+  install -Dm644 "$srcdir/bootloader-$_gravity_commit/LICENSE.MIT" "$pkgdir/usr/share/licenses/$pkgname/gravity-LICENSE.MIT"
+  install -Dm644 "$srcdir/bootloader-$_gravity_commit/LICENSE.GPL2" "$pkgdir/usr/share/licenses/$pkgname/gravity-LICENSE.GPL2"
   # Existing installer image code reads these paths and requires regular files.
   install -Dm644 "$srcdir/stage1/m1n1-raw.bin" "$pkgdir/usr/share/aura/stage1/aura-raw.bin"
   install -Dm644 "$srcdir/stage1/m1n1.macho" "$pkgdir/usr/share/aura/stage1/aura.macho"
